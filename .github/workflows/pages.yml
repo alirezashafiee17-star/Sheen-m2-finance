@@ -27,7 +27,7 @@ jobs:
         uses: actions/configure-pages@v5
         with:
           enablement: true
-      - name: Upload website
+      - name: Upload Sheen Finance website
         uses: actions/upload-pages-artifact@v3
         with:
           path: .

@@ -31,6 +31,6 @@ jobs:
         uses: actions/upload-pages-artifact@v3
         with:
           path: .
-      - name: Deploy website
+      - name: Deploy Sheen Finance website
         id: deployment
         uses: actions/deploy-pages@v4

@@ -1,6 +1,7 @@
 {
   "name": "sheen-finance",
   "version": "3.0.0",
+  "description": "Sheen Finance web application",
   "private": true,
   "scripts": {
     "start": "node server.js"

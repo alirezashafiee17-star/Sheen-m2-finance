@@ -25,7 +25,7 @@ if(!DATABASE_URL||!JWT_SECRET||!OWNER_EMAIL||!OWNER_PASSWORD){
  process.exit(1);
 }
 const pool=new Pool({connectionString:DATABASE_URL,ssl:process.env.DB_SSL==="true"?{rejectUnauthorized:false}:false});
-const q=(text,params=[])=>pool.query(text,params);
+const q=(text,params=[])=>pool.query(text,params);\nlet dbReady=false;\nlet dbErrorCode="STARTING";
 const cleanEmail=v=>String(v||"").trim().toLowerCase();
 const publicUser=u=>({id:u.id,name:u.name,email:u.email,role:u.role});
 function sign(u){return jwt.sign({sub:u.id,email:u.email,role:u.role},JWT_SECRET,{expiresIn:"30d"})}
@@ -68,7 +68,7 @@ function currentPeriod(){return periodOf(new Date())}
 async function closePastPeriods(){
  await q("INSERT INTO periods(period,closed,closed_at) SELECT DISTINCT period,true,NOW() FROM transactions WHERE period<>$1 ON CONFLICT(period) DO UPDATE SET closed=true,closed_at=COALESCE(periods.closed_at,NOW())",[currentPeriod()]);
 }
-app.get("/api/health",async(req,res)=>{try{await q("SELECT 1");res.json({ok:true})}catch(e){res.status(503).json({ok:false})}});
+app.get("/api/health",async(req,res)=>{try{await q("SELECT 1");dbReady=true;dbErrorCode="";res.json({ok:true})}catch(e){dbReady=false;dbErrorCode=e.code||"DB_UNAVAILABLE";res.status(503).json({ok:false,code:dbErrorCode})}});\napp.use("/api",(req,res,next)=>dbReady?next():res.status(503).json({error:"پایگاه داده در حال اتصال است",code:dbErrorCode}));
 app.post("/api/auth/login",async(req,res)=>{
  const email=cleanEmail(req.body.email),password=String(req.body.password||"");
  const r=await q("SELECT * FROM users WHERE email=$1 AND active=true",[email]);
@@ -121,4 +121,4 @@ app.post("/api/import",auth,allow("owner"),async(req,res)=>{
 });
 app.use(express.static(path.join(__dirname)));
 app.get("*",(req,res)=>res.sendFile(path.join(__dirname,"index.html")));
-init().then(()=>app.listen(PORT,"0.0.0.0",()=>console.log("Sheen Finance ready on",PORT))).catch(e=>{console.error(e);process.exit(1)});
+app.listen(PORT,"0.0.0.0",()=>console.log("Sheen Finance ready on",PORT));\nasync function connectDatabase(){\n try{await init();dbReady=true;dbErrorCode="";console.log("Database ready")}\n catch(e){dbReady=false;dbErrorCode=e.code||"DB_UNAVAILABLE";console.error("Database unavailable",dbErrorCode);setTimeout(connectDatabase,10000)}\n}\nconnectDatabase();

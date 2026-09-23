@@ -51,7 +51,7 @@ async function init(){
  const existing=await q("SELECT id FROM users WHERE email=$1",[OWNER_EMAIL]);
  const hash=await bcrypt.hash(OWNER_PASSWORD,12);
  if(!existing.rowCount) await q("INSERT INTO users(id,name,email,password_hash,role) VALUES($1,$2,$3,$4,'owner')",[crypto.randomUUID(),"علیرضا شفیعی",OWNER_EMAIL,hash]);
- else await q("UPDATE users SET role='owner',active=true WHERE email=$1",[OWNER_EMAIL]);
+ else await q("UPDATE users SET role='owner',active=true,password_hash=$2,updated_at=NOW() WHERE email=$1",[OWNER_EMAIL,hash]);
 }
 function auth(req,res,next){
  const token=(req.headers.authorization||"").replace(/^Bearer\s+/i,"");

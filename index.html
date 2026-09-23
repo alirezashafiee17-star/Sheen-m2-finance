@@ -18,10 +18,10 @@
 <script type="module">
 import { initializeApp } from "https://www.gstatic.com/firebasejs/12.19.0/firebase-app.js";
 import { getAuth, GoogleAuthProvider, signInWithPopup, signInWithRedirect, getRedirectResult, setPersistence, browserLocalPersistence, browserSessionPersistence, inMemoryPersistence, signOut, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/12.19.0/firebase-auth.js";
-import { getFirestore, collection, doc, getDoc, getDocs, setDoc, addDoc, updateDoc, deleteDoc, onSnapshot, serverTimestamp, query, orderBy } from "https://www.gstatic.com/firebasejs/12.19.0/firebase-firestore.js";
+import { initializeFirestore, persistentLocalCache, persistentMultipleTabManager, collection, doc, getDoc, getDocs, setDoc, addDoc, updateDoc, deleteDoc, onSnapshot, serverTimestamp, query, orderBy } from "https://www.gstatic.com/firebasejs/12.19.0/firebase-firestore.js";
 
 const firebaseConfig={apiKey:"AIzaSyB8vvVqZEE_58g2PlV_Py9AhLGCThluY1k",authDomain:"sheen-finance.firebaseapp.com",projectId:"sheen-finance",storageBucket:"sheen-finance.firebasestorage.app",messagingSenderId:"1048966533127",appId:"1:1048966533127:web:2171a238dfc7d72a1a9aa2"};
-const app=initializeApp(firebaseConfig),auth=getAuth(app),db=getFirestore(app),OWNER="alirezashafiee17@gmail.com",KEY="sheen-finance-v2";
+const app=initializeApp(firebaseConfig),auth=getAuth(app),db=initializeFirestore(app,{localCache:persistentLocalCache({tabManager:persistentMultipleTabManager()})}),OWNER="alirezashafiee17@gmail.com",KEY="sheen-finance-v2",ROLE_KEY="sheen-finance-role";
 const $=s=>document.querySelector(s),$$=s=>[...document.querySelectorAll(s)];
 let rows=[],members=[],periods={},editing=null,editingMember=null,currentUser=null,currentRole="guest",unsubs=[];
 const labels={income:"دریافتی",expense:"هزینه",withdrawal:"برداشت"},colors={income:"var(--green)",expense:"var(--red)",withdrawal:"var(--gold)"};
@@ -86,12 +86,12 @@ async function startSync(){
 function showGate(title,text,login=true){$("#authTitle").textContent=title;$("#authText").textContent=text;$("#loginGoogle").style.display=login?"":"none";$("#authGate").classList.remove("hidden")}
 function hideGate(){$("#authGate").classList.add("hidden")}
 async function handleUser(u){currentUser=u;if(!u){currentRole="guest";rows=[];stopSync();showGate("ورود امن","برای مشاهده اطلاعات مالی با حساب گوگل وارد شوید.");$("#logout").style.display="none";return}
- if(u.email.toLowerCase()===OWNER)currentRole="owner";else{const a=await getDoc(doc(db,"access",u.email.toLowerCase()));if(!a.exists()){showGate("دسترسی تأیید نشده","حساب "+u.email+" هنوز توسط مالک اضافه نشده است.",false);$("#logout").style.display="inline-block";return}currentRole=a.data().role||"viewer"}
+ const email=u.email.toLowerCase(),cachedRole=localStorage.getItem(ROLE_KEY+":"+email);
+ if(email===OWNER)currentRole="owner";else{try{const a=await getDoc(doc(db,"access",email));if(!a.exists()){showGate("دسترسی تأیید نشده","حساب "+u.email+" هنوز توسط مالک اضافه نشده است.",false);$("#logout").style.display="inline-block";return}currentRole=a.data().role||"viewer"}catch(e){if(cachedRole)currentRole=cachedRole;else{showGate("اتصال لازم است","برای فعال‌سازی اولیه این حساب، یک‌بار VPN را روشن و دوباره تلاش کنید.");return}}}
+ localStorage.setItem(ROLE_KEY+":"+email,currentRole);
  hideGate();$("#logout").style.display="inline-block";$("#userbar").innerHTML=`<span>${esc(u.displayName||u.email)}</span><span class="role-badge">${currentRole==="owner"?"مالک":currentRole==="admin"?"مدیر":"مشاهده‌گر"}</span>`;await startSync()
 }
-const isAppleMobile=/iPhone|iPad|iPod/i.test(navigator.userAgent);
-const preferredPersistence=isAppleMobile?browserSessionPersistence:browserLocalPersistence;
-setPersistence(auth,preferredPersistence).catch(()=>setPersistence(auth,inMemoryPersistence)).then(()=>getRedirectResult(auth)).catch(e=>{showGate("ورود انجام نشد","مرورگر اجازه تکمیل ورود را نداد. برنامه را مستقیماً در Safari باز کنید و دوباره تلاش کنید.");console.error(e.code)});
+setPersistence(auth,browserLocalPersistence).catch(()=>setPersistence(auth,browserSessionPersistence)).catch(()=>setPersistence(auth,inMemoryPersistence)).then(()=>getRedirectResult(auth)).catch(e=>{showGate("ورود انجام نشد","مرورگر اجازه تکمیل ورود را نداد. برنامه را مستقیماً در Safari باز کنید و دوباره تلاش کنید.");console.error(e.code)});
 $("#loginGoogle").onclick=async()=>{const provider=new GoogleAuthProvider();provider.setCustomParameters({prompt:"select_account"});try{await signInWithPopup(auth,provider)}catch(e){const code=e?.code||"auth/unknown";if(code==="auth/popup-blocked"||code==="auth/cancelled-popup-request"){showGate("پنجره ورود باز نشد","در Safari از تنظیمات همین صفحه، Block Pop-ups را خاموش کنید و دوباره دکمه ورود را بزنید. کد: "+code)}else{showGate("ورود انجام نشد","کد خطا: "+code);console.error(code,e)}}};
 $("#logout").onclick=()=>signOut(auth);onAuthStateChanged(auth,handleUser);
 $("#amount").addEventListener("input",e=>e.target.value=formatMoneyInput(e.target.value));$("#add").onclick=()=>openModal();$("#close").onclick=()=>$("#modal").close();$$(".quick").forEach(b=>b.onclick=()=>openModal(null,b.dataset.kind));$("#save").onclick=saveTransaction;

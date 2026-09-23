@@ -1,6 +1,6 @@
 const $=s=>document.querySelector(s),$$=s=>[...document.querySelectorAll(s)];
 const TOKEN_KEY="sheen-finance-token",LEGACY_KEY="sheen-finance-v2";
-let token=localStorage.getItem(TOKEN_KEY)||"",rows=[],members=[],periods={},editing=null,editingMember=null,currentUser=null,currentRole="guest";
+let token=localStorage.getItem(TOKEN_KEY)||sessionStorage.getItem(TOKEN_KEY)||"",rows=[],members=[],periods={},editing=null,editingMember=null,currentUser=null,currentRole="guest";
 const labels={income:"دریافتی",expense:"هزینه",withdrawal:"برداشت"},colors={income:"var(--green)",expense:"var(--red)",withdrawal:"var(--gold)"};
 const esc=v=>String(v??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 const toman=n=>new Intl.NumberFormat("fa-IR").format(Number(n)||0)+" تومان";
@@ -40,8 +40,8 @@ async function loadAll(){rows=await api("/transactions");periods=await api("/per
 function showGate(title,text){$("#authTitle").textContent=title;$("#authText").textContent=text;$("#authGate").classList.remove("hidden")}
 function hideGate(){$("#authGate").classList.add("hidden")}
 async function enter(user){currentUser=user;currentRole=user.role;hideGate();$("#logout").style.display="inline-block";$("#userbar").innerHTML=`<span>${esc(user.name||user.email)}</span><span class="role-badge">${currentRole==="owner"?"مالک":currentRole==="admin"?"مدیر":"مشاهده‌گر"}</span>`;await loadAll();await importLocal()}
-function logout(){token="";currentUser=null;currentRole="guest";localStorage.removeItem(TOKEN_KEY);rows=[];members=[];$("#logout").style.display="none";$("#userbar").innerHTML="";showGate("ورود امن","برای ورود، ایمیل و رمز عبور خود را وارد کنید.")}
-$("#loginBtn").onclick=async()=>{const email=$("#loginEmail").value.trim(),password=$("#loginPassword").value;$("#loginBtn").disabled=true;try{const r=await api("/auth/login",{method:"POST",body:JSON.stringify({email,password})});token=r.token;localStorage.setItem(TOKEN_KEY,token);await enter(r.user)}catch(e){showGate("ورود انجام نشد",e.message)}finally{$("#loginBtn").disabled=false}};
+function logout(){token="";currentUser=null;currentRole="guest";localStorage.removeItem(TOKEN_KEY);sessionStorage.removeItem(TOKEN_KEY);rows=[];members=[];$("#logout").style.display="none";$("#userbar").innerHTML="";showGate("ورود امن","برای ورود، ایمیل و رمز عبور خود را وارد کنید.")}
+$("#loginBtn").onclick=async()=>{const email=$("#loginEmail").value.trim(),password=$("#loginPassword").value,remember=$("#rememberMe").checked;$("#loginBtn").disabled=true;try{const r=await api("/auth/login",{method:"POST",body:JSON.stringify({email,password})});token=r.token;localStorage.removeItem(TOKEN_KEY);sessionStorage.removeItem(TOKEN_KEY);(remember?localStorage:sessionStorage).setItem(TOKEN_KEY,token);await enter(r.user)}catch(e){showGate("ورود انجام نشد",e.message)}finally{$("#loginBtn").disabled=false}};
 $("#loginPassword").onkeydown=e=>{if(e.key==="Enter")$("#loginBtn").click()};
 $("#logout").onclick=logout;$("#amount").addEventListener("input",e=>e.target.value=formatMoneyInput(e.target.value));$("#add").onclick=()=>openModal();$("#close").onclick=()=>$("#modal").close();$$(".quick").forEach(b=>b.onclick=()=>openModal(null,b.dataset.kind));$("#save").onclick=saveTransaction;
 $("#addMember").onclick=()=>openMember();$("#closeMember").onclick=()=>$("#memberModal").close();$("#saveMember").onclick=saveMember;$("#searchTx").oninput=renderTransactions;$("#monthFilter").onchange=renderTransactions;$("#kindFilter").onchange=renderTransactions;

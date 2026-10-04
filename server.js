@@ -25,7 +25,9 @@ if(!DATABASE_URL||!JWT_SECRET||!OWNER_EMAIL||!OWNER_PASSWORD){
  process.exit(1);
 }
 const pool=new Pool({connectionString:DATABASE_URL,ssl:process.env.DB_SSL==="true"?{rejectUnauthorized:false}:false});
-const q=(text,params=[])=>pool.query(text,params);\nlet dbReady=false;\nlet dbErrorCode="STARTING";
+const q=(text,params=[])=>pool.query(text,params);
+let dbReady=false;
+let dbErrorCode="STARTING";
 const cleanEmail=v=>String(v||"").trim().toLowerCase();
 const publicUser=u=>({id:u.id,name:u.name,email:u.email,role:u.role});
 function sign(u){return jwt.sign({sub:u.id,email:u.email,role:u.role},JWT_SECRET,{expiresIn:"30d"})}
@@ -47,6 +49,14 @@ async function init(){
  ); CREATE TABLE IF NOT EXISTS audit_log(
   id UUID PRIMARY KEY, action TEXT NOT NULL, target TEXT, data JSONB NOT NULL DEFAULT '{}',
   actor_id UUID REFERENCES users(id), created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+ ); CREATE TABLE IF NOT EXISTS transaction_edits(
+  id UUID PRIMARY KEY, transaction_id UUID NOT NULL REFERENCES transactions(id),
+  actor_id UUID REFERENCES users(id), actor_name TEXT NOT NULL,
+  before_amount BIGINT NOT NULL, after_amount BIGINT NOT NULL,
+  before_kind TEXT NOT NULL, after_kind TEXT NOT NULL,
+  before_description TEXT NOT NULL, after_description TEXT NOT NULL,
+  before_happened_at TIMESTAMPTZ NOT NULL, after_happened_at TIMESTAMPTZ NOT NULL,
+  edited_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
  );`);
  const existing=await q("SELECT id FROM users WHERE email=$1",[OWNER_EMAIL]);
  const hash=await bcrypt.hash(OWNER_PASSWORD,12);
@@ -68,7 +78,8 @@ function currentPeriod(){return periodOf(new Date())}
 async function closePastPeriods(){
  await q("INSERT INTO periods(period,closed,closed_at) SELECT DISTINCT period,true,NOW() FROM transactions WHERE period<>$1 ON CONFLICT(period) DO UPDATE SET closed=true,closed_at=COALESCE(periods.closed_at,NOW())",[currentPeriod()]);
 }
-app.get("/api/health",async(req,res)=>{try{await q("SELECT 1");dbReady=true;dbErrorCode="";res.json({ok:true})}catch(e){dbReady=false;dbErrorCode=e.code||"DB_UNAVAILABLE";res.status(503).json({ok:false,code:dbErrorCode})}});\napp.use("/api",(req,res,next)=>dbReady?next():res.status(503).json({error:"پایگاه داده در حال اتصال است",code:dbErrorCode}));
+app.get("/api/health",async(req,res)=>{try{await q("SELECT 1");dbReady=true;dbErrorCode="";res.json({ok:true})}catch(e){dbReady=false;dbErrorCode=e.code||"DB_UNAVAILABLE";res.status(503).json({ok:false,code:dbErrorCode})}});
+app.use("/api",(req,res,next)=>dbReady?next():res.status(503).json({error:"پایگاه داده در حال اتصال است",code:dbErrorCode}));
 app.post("/api/auth/login",async(req,res)=>{
  const email=cleanEmail(req.body.email),password=String(req.body.password||"");
  const r=await q("SELECT * FROM users WHERE email=$1 AND active=true",[email]);
@@ -81,6 +92,15 @@ app.get("/api/transactions",auth,async(req,res)=>{
  const r=await q("SELECT id,kind,amount::text,description AS desc,happened_at AS date,period,actor_name AS \"actorName\",actor_email AS \"actorEmail\" FROM transactions ORDER BY happened_at DESC");
  res.json(r.rows.map(x=>({...x,amount:Number(x.amount)})));
 });
+app.get("/api/transaction-edits",auth,async(req,res)=>{
+ const r=await q(`SELECT transaction_id AS "transactionId",actor_name AS "actorName",
+ before_amount::text AS "beforeAmount",after_amount::text AS "afterAmount",
+ before_kind AS "beforeKind",after_kind AS "afterKind",
+ before_description AS "beforeDescription",after_description AS "afterDescription",
+ before_happened_at AS "beforeDate",after_happened_at AS "afterDate",edited_at AS "editedAt"
+ FROM transaction_edits ORDER BY edited_at ASC,id ASC`);
+ res.json(r.rows.map(x=>({...x,beforeAmount:Number(x.beforeAmount),afterAmount:Number(x.afterAmount)})));
+});
 app.post("/api/transactions",auth,allow("owner","admin"),async(req,res)=>{
  const amount=Math.trunc(Number(req.body.amount)),kind=req.body.kind,desc=String(req.body.desc||"").trim(),date=new Date(req.body.date),period=periodOf(req.body.date);
  if(!amount||amount<1||!["income","expense","withdrawal"].includes(kind)||!desc||!period||Number.isNaN(date.getTime()))return res.status(400).json({error:"اطلاعات تراکنش کامل نیست"});
@@ -90,12 +110,28 @@ app.post("/api/transactions",auth,allow("owner","admin"),async(req,res)=>{
  await audit(req.user,"create_transaction",id,{amount,kind,desc,date:req.body.date});res.status(201).json({id});
 });
 app.put("/api/transactions/:id",auth,allow("owner","admin"),async(req,res)=>{
- const old=await q("SELECT * FROM transactions WHERE id=$1",[req.params.id]);if(!old.rowCount)return res.status(404).json({error:"تراکنش پیدا نشد"});
- if(req.user.role!=="owner"&&(old.rows[0].period!==currentPeriod()||(await q("SELECT closed FROM periods WHERE period=$1",[old.rows[0].period])).rows[0]?.closed))return res.status(403).json({error:"ماه بسته شده است"});
  const amount=Math.trunc(Number(req.body.amount)),kind=req.body.kind,desc=String(req.body.desc||"").trim(),date=new Date(req.body.date),period=periodOf(req.body.date);
- if(!amount||!["income","expense","withdrawal"].includes(kind)||!desc||!period||Number.isNaN(date.getTime()))return res.status(400).json({error:"اطلاعات نامعتبر"});
- await q("UPDATE transactions SET kind=$1,amount=$2,description=$3,happened_at=$4,period=$5,updated_at=NOW() WHERE id=$6",[kind,amount,desc,date.toISOString(),period,req.params.id]);
- await audit(req.user,"update_transaction",req.params.id,{amount,kind,desc,date:req.body.date});res.json({ok:true});
+ if(!Number.isSafeInteger(amount)||amount<1||!["income","expense","withdrawal"].includes(kind)||!desc||!period||Number.isNaN(date.getTime()))return res.status(400).json({error:"اطلاعات نامعتبر"});
+ const client=await pool.connect();
+ try{
+  await client.query("BEGIN");
+  const old=await client.query("SELECT * FROM transactions WHERE id=$1 FOR UPDATE",[req.params.id]);
+  if(!old.rowCount){await client.query("ROLLBACK");return res.status(404).json({error:"تراکنش پیدا نشد"})}
+  const before=old.rows[0];
+  if(req.user.role!=="owner"){
+   const pr=await client.query("SELECT closed FROM periods WHERE period=$1",[before.period]);
+   if(before.period!==currentPeriod()||pr.rows[0]?.closed){await client.query("ROLLBACK");return res.status(403).json({error:"ماه بسته شده است"})}
+  }
+  const user=await client.query("SELECT name FROM users WHERE id=$1 AND active=true",[req.user.sub]);
+  if(!user.rowCount){await client.query("ROLLBACK");return res.status(401).json({error:"حساب غیرفعال است"})}
+  await client.query("UPDATE transactions SET kind=$1,amount=$2,description=$3,happened_at=$4,period=$5,updated_at=NOW() WHERE id=$6",[kind,amount,desc,date.toISOString(),period,req.params.id]);
+  await client.query(`INSERT INTO transaction_edits(id,transaction_id,actor_id,actor_name,before_amount,after_amount,before_kind,after_kind,before_description,after_description,before_happened_at,after_happened_at)
+   VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
+   [crypto.randomUUID(),req.params.id,req.user.sub,user.rows[0].name,before.amount,amount,before.kind,kind,before.description,desc,before.happened_at,date.toISOString()]);
+  await client.query("COMMIT");
+  res.json({ok:true});
+ }catch(e){await client.query("ROLLBACK").catch(()=>{});console.error("Transaction update failed",e.code||e.message);res.status(500).json({error:"ویرایش ذخیره نشد؛ دوباره تلاش کنید"})}
+ finally{client.release()}
 });
 app.get("/api/periods",auth,async(req,res)=>{await closePastPeriods();const r=await q("SELECT period,closed FROM periods");res.json(Object.fromEntries(r.rows.map(x=>[x.period,x])))});
 app.get("/api/members",auth,allow("owner"),async(req,res)=>{const r=await q("SELECT id,name,email,role,active FROM users WHERE role<>'owner' ORDER BY created_at");res.json(r.rows)});
@@ -121,4 +157,9 @@ app.post("/api/import",auth,allow("owner"),async(req,res)=>{
 });
 app.use(express.static(path.join(__dirname)));
 app.get("*",(req,res)=>res.sendFile(path.join(__dirname,"index.html")));
-app.listen(PORT,"0.0.0.0",()=>console.log("Sheen Finance ready on",PORT));\nasync function connectDatabase(){\n try{await init();dbReady=true;dbErrorCode="";console.log("Database ready")}\n catch(e){dbReady=false;dbErrorCode=e.code||"DB_UNAVAILABLE";console.error("Database unavailable",dbErrorCode);setTimeout(connectDatabase,10000)}\n}\nconnectDatabase();
+app.listen(PORT,"0.0.0.0",()=>console.log("Sheen Finance ready on",PORT));
+async function connectDatabase(){
+ try{await init();dbReady=true;dbErrorCode="";console.log("Database ready")}
+ catch(e){dbReady=false;dbErrorCode=e.code||"DB_UNAVAILABLE";console.error("Database unavailable",dbErrorCode);setTimeout(connectDatabase,10000)}
+}
+connectDatabase();

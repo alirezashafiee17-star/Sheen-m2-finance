@@ -1,6 +1,6 @@
 const $=s=>document.querySelector(s),$$=s=>[...document.querySelectorAll(s)];
 const TOKEN_KEY="sheen-finance-token",LEGACY_KEY="sheen-finance-v2";
-let token=localStorage.getItem(TOKEN_KEY)||sessionStorage.getItem(TOKEN_KEY)||"",rows=[],members=[],periods={},editing=null,editingMember=null,currentUser=null,currentRole="guest";
+let token=localStorage.getItem(TOKEN_KEY)||sessionStorage.getItem(TOKEN_KEY)||"",rows=[],members=[],periods={},edits=[],editing=null,editingMember=null,currentUser=null,currentRole="guest";
 const labels={income:"دریافتی",expense:"هزینه",withdrawal:"برداشت"},colors={income:"var(--green)",expense:"var(--red)",withdrawal:"var(--gold)"};
 const esc=v=>String(v??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 const toman=n=>new Intl.NumberFormat("fa-IR").format(Number(n)||0)+" تومان";
@@ -17,7 +17,17 @@ function canEditRow(r){return currentRole==="owner"||(currentRole==="admin"&&r.p
 function stats(list=rows){let income=0,expense=0,withdrawal=0;for(const r of list){if(r.kind==="income")income+=r.amount;if(r.kind==="expense")expense+=r.amount;if(r.kind==="withdrawal")withdrawal+=r.amount}const profit=income-expense;return{income,expense,withdrawal,profit,cash:profit-withdrawal}}
 function toast(v){$("#toast").textContent=v;$("#toast").style.display="block";setTimeout(()=>$("#toast").style.display="none",2500)}
 async function api(url,opt={}){const headers={"Content-Type":"application/json",...(opt.headers||{})};if(token)headers.Authorization="Bearer "+token;const r=await fetch("/api"+url,{...opt,headers});let data={};try{data=await r.json()}catch{}if(!r.ok){if(r.status===401&&url!=="/auth/login")logout();throw new Error(data.error||"خطا در ارتباط با سرور")}return data}
-function rowHTML(r){return `<div class="row">${canEditRow(r)?`<button class="edit" data-edit="${r.id}">ویرایش</button>`:"<span></span>"}<div><div class="row-title">${esc(r.desc)}</div><div class="meta">${fmtDate(r.date)} · ${esc(r.actorName||r.actorEmail||"—")}</div></div><div><div class="amount" style="color:${colors[r.kind]}">${toman(r.amount)}</div><div class="kind">${labels[r.kind]}</div></div></div>`}
+function editHistoryHTML(r){
+ const history=edits.filter(e=>e.transactionId===r.id);
+ if(!history.length)return "";
+ return `<details class="edit-history"><summary>تاریخچه ویرایش (${new Intl.NumberFormat("fa-IR").format(history.length)})</summary>${history.map(e=>{
+  const delta=e.afterAmount-e.beforeAmount;
+  const amountChange=delta?`<span class="edit-delta ${delta>0?"increase":"decrease"}">${delta>0?"افزایش":"کاهش"} ${toman(Math.abs(delta))}</span> <span class="meta">(قبلی: ${toman(e.beforeAmount)}، جدید: ${toman(e.afterAmount)})</span>`:'<span class="meta">مبلغ تغییر نکرده</span>';
+  const otherChanges=[e.beforeKind!==e.afterKind?"نوع":"",e.beforeDescription!==e.afterDescription?"شرح":"",new Date(e.beforeDate).getTime()!==new Date(e.afterDate).getTime()?"تاریخ تراکنش":""].filter(Boolean);
+  return `<div class="edit-event"><div><strong>${esc(e.actorName)}</strong> · ${fmtDate(e.editedAt)}</div><div>${amountChange}</div>${otherChanges.length?`<div class="meta">تغییر در ${otherChanges.join("، ")}</div>`:""}</div>`
+ }).join("")}</details>`
+}
+function rowHTML(r){return `<div class="row-wrap"><div class="row">${canEditRow(r)?`<button class="edit" data-edit="${r.id}">ویرایش</button>`:"<span></span>"}<div><div class="row-title">${esc(r.desc)}</div><div class="meta">${fmtDate(r.date)} · ثبت توسط ${esc(r.actorName||r.actorEmail||"—")}</div></div><div><div class="amount" style="color:${colors[r.kind]}">${toman(r.amount)}</div><div class="kind">${labels[r.kind]}</div></div></div>${editHistoryHTML(r)}</div>`}
 function filteredRows(){const q=normalizeDigits($("#searchTx")?.value||"").toLowerCase(),month=$("#monthFilter")?.value||"all",kind=$("#kindFilter")?.value||"all";return rows.filter(r=>(month==="all"||r.period===month)&&(kind==="all"||r.kind===kind)&&(!q||normalizeDigits(r.desc).toLowerCase().includes(q)||String(r.amount).includes(q.replace(/\D/g,""))))}
 function render(){
  const s=stats(),sorted=[...rows].sort((a,b)=>new Date(b.date)-new Date(a.date));
@@ -36,11 +46,11 @@ function openMember(m=null){if(currentRole!=="owner")return;editingMember=m?.id|
 async function saveTransaction(){const amount=parseMoney($("#amount").value),desc=$("#desc").value.trim(),date=$("#date").value,kind=$("#kind").value;if(!amount||!desc||!date)return toast("مبلغ، شرح و تاریخ را کامل کن");try{await api("/transactions"+(editing?"/"+editing:""),{method:editing?"PUT":"POST",body:JSON.stringify({amount,desc,kind,date:new Date(date).toISOString()})});$("#modal").close();await loadAll();toast("ذخیره و همگام شد")}catch(e){toast(e.message)}}
 async function saveMember(){const name=$("#memberName").value.trim(),email=$("#memberEmail").value.trim().toLowerCase(),role=$("#memberRole").value,password=$("#memberPassword").value;if(!name||(!editingMember&&!/^\S+@\S+\.\S+$/.test(email)))return toast("نام و ایمیل معتبر وارد کن");if(!editingMember&&password.length<8)return toast("رمز باید حداقل ۸ حرف باشد");try{await api("/members"+(editingMember?"/"+editingMember:""),{method:editingMember?"PUT":"POST",body:JSON.stringify({name,email,role,password})});$("#memberModal").close();await loadAll();toast("دسترسی عضو ذخیره شد")}catch(e){toast(e.message)}}
 async function importLocal(){let local=[];try{local=JSON.parse(localStorage.getItem(LEGACY_KEY)||"[]")}catch{}if(currentRole!=="owner"||!Array.isArray(local)||!local.length||rows.length)return;try{const r=await api("/import",{method:"POST",body:JSON.stringify(local)});if(r.count){localStorage.removeItem(LEGACY_KEY);toast(r.count+" تراکنش قبلی منتقل شد");await loadAll()}}catch{}}
-async function loadAll(){rows=await api("/transactions");periods=await api("/periods");if(currentRole==="owner")members=await api("/members");render()}
+async function loadAll(){[rows,edits,periods]=await Promise.all([api("/transactions"),api("/transaction-edits"),api("/periods")]);if(currentRole==="owner")members=await api("/members");render()}
 function showGate(title,text){$("#authTitle").textContent=title;$("#authText").textContent=text;$("#authGate").classList.remove("hidden")}
 function hideGate(){$("#authGate").classList.add("hidden")}
 async function enter(user){currentUser=user;currentRole=user.role;hideGate();$("#logout").style.display="inline-block";$("#userbar").innerHTML=`<span>${esc(user.name||user.email)}</span><span class="role-badge">${currentRole==="owner"?"مالک":currentRole==="admin"?"مدیر":"مشاهده‌گر"}</span>`;await loadAll();await importLocal()}
-function logout(){token="";currentUser=null;currentRole="guest";localStorage.removeItem(TOKEN_KEY);sessionStorage.removeItem(TOKEN_KEY);rows=[];members=[];$("#logout").style.display="none";$("#userbar").innerHTML="";showGate("ورود امن","برای ورود، ایمیل و رمز عبور خود را وارد کنید.")}
+function logout(){token="";currentUser=null;currentRole="guest";localStorage.removeItem(TOKEN_KEY);sessionStorage.removeItem(TOKEN_KEY);rows=[];edits=[];members=[];$("#logout").style.display="none";$("#userbar").innerHTML="";showGate("ورود امن","برای ورود، ایمیل و رمز عبور خود را وارد کنید.")}
 $("#loginBtn").onclick=async()=>{const email=$("#loginEmail").value.trim(),password=$("#loginPassword").value,remember=$("#rememberMe").checked;$("#loginBtn").disabled=true;try{const r=await api("/auth/login",{method:"POST",body:JSON.stringify({email,password})});token=r.token;localStorage.removeItem(TOKEN_KEY);sessionStorage.removeItem(TOKEN_KEY);(remember?localStorage:sessionStorage).setItem(TOKEN_KEY,token);await enter(r.user)}catch(e){showGate("ورود انجام نشد",e.message)}finally{$("#loginBtn").disabled=false}};
 $("#loginPassword").onkeydown=e=>{if(e.key==="Enter")$("#loginBtn").click()};
 $("#logout").onclick=logout;$("#amount").addEventListener("input",e=>e.target.value=formatMoneyInput(e.target.value));$("#add").onclick=()=>openModal();$("#close").onclick=()=>$("#modal").close();$$(".quick").forEach(b=>b.onclick=()=>openModal(null,b.dataset.kind));$("#save").onclick=saveTransaction;
@@ -49,4 +59,3 @@ $$(".tab").forEach(b=>b.onclick=()=>{$$(".tab").forEach(x=>x.classList.toggle("a
 $("#share").onclick=async()=>{const url=location.origin+location.pathname;try{await navigator.clipboard.writeText(url);toast("لینک ثابت برنامه کپی شد")}catch{prompt("لینک برنامه",url)}};
 $("#updateApp").onclick=async()=>{try{await loadAll();toast("برنامه بروزرسانی شد")}catch(e){toast(e.message)}};
 (async()=>{if(!token)return logout();try{await enter(await api("/me"))}catch{logout()}})();
-

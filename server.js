@@ -7,13 +7,14 @@ const {Pool}=require("pg");
 const helmet=require("helmet");
 const compression=require("compression");
 const rateLimit=require("express-rate-limit");
+const {generateRegistrationOptions,verifyRegistrationResponse,generateAuthenticationOptions,verifyAuthenticationResponse}=require("@simplewebauthn/server");
 
 const app=express();
 app.set("trust proxy",1);
 app.use(helmet({contentSecurityPolicy:false}));
 app.use(compression());
 app.use(express.json({limit:"2mb"}));
-app.use("/api/auth",rateLimit({windowMs:15*60*1000,max:30,standardHeaders:true,legacyHeaders:false}));
+app.use("/api/auth",rateLimit({windowMs:15*60*1000,max:60,standardHeaders:true,legacyHeaders:false}));
 
 const PORT=Number(process.env.PORT||3000);
 const DATABASE_URL=process.env.DATABASE_URL;
@@ -28,6 +29,10 @@ const pool=new Pool({connectionString:DATABASE_URL,ssl:process.env.DB_SSL==="tru
 const q=(text,params=[])=>pool.query(text,params);
 let dbReady=false;
 let dbErrorCode="STARTING";
+const passkeyChallenges=new Map();
+const RP_ID=process.env.PASSKEY_RP_ID||"www.sheenfinance.ir";
+const ORIGIN=process.env.PASSKEY_ORIGIN||"https://www.sheenfinance.ir";
+const passkeyUserID=id=>new Uint8Array(Buffer.from(id.replace(/-/g,""),"hex"));
 const cleanEmail=v=>String(v||"").trim().toLowerCase();
 const publicUser=u=>({id:u.id,name:u.name,email:u.email,role:u.role});
 function sign(u){return jwt.sign({sub:u.id,email:u.email,role:u.role},JWT_SECRET,{expiresIn:"30d"})}
@@ -57,6 +62,9 @@ async function init(){
   before_description TEXT NOT NULL, after_description TEXT NOT NULL,
   before_happened_at TIMESTAMPTZ NOT NULL, after_happened_at TIMESTAMPTZ NOT NULL,
   edited_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+ ); CREATE TABLE IF NOT EXISTS passkeys(
+  id TEXT PRIMARY KEY, user_id UUID NOT NULL REFERENCES users(id), public_key BYTEA NOT NULL,
+  counter BIGINT NOT NULL DEFAULT 0, transports TEXT[] NOT NULL DEFAULT '{}', created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
  );`);
  const existing=await q("SELECT id FROM users WHERE email=$1",[OWNER_EMAIL]);
  const hash=await bcrypt.hash(OWNER_PASSWORD,12);
@@ -85,6 +93,32 @@ app.post("/api/auth/login",async(req,res)=>{
  const r=await q("SELECT * FROM users WHERE email=$1 AND active=true",[email]);
  if(!r.rowCount||!await bcrypt.compare(password,r.rows[0].password_hash)) return res.status(401).json({error:"ایمیل یا رمز عبور اشتباه است"});
  res.json({token:sign(r.rows[0]),user:publicUser(r.rows[0])});
+});
+app.post("/api/auth/passkey/register/options",auth,async(req,res)=>{
+ const u=await q("SELECT id,name,email FROM users WHERE id=$1 AND active=true",[req.user.sub]);
+ if(!u.rowCount)return res.status(401).json({error:"حساب غیرفعال است"});
+ const existing=await q("SELECT id,transports FROM passkeys WHERE user_id=$1",[req.user.sub]);
+ const options=await generateRegistrationOptions({rpName:"Sheen Finance",rpID:RP_ID,userID:passkeyUserID(u.rows[0].id),userName:u.rows[0].email,userDisplayName:u.rows[0].name,attestationType:"none",authenticatorSelection:{residentKey:"preferred",userVerification:"required"},excludeCredentials:existing.rows.map(x=>({id:x.id,transports:x.transports}))});
+ passkeyChallenges.set("reg:"+req.user.sub,{challenge:options.challenge,expires:Date.now()+300000});res.json(options);
+});
+app.post("/api/auth/passkey/register",auth,async(req,res)=>{
+ try{const key="reg:"+req.user.sub, saved=passkeyChallenges.get(key);if(!saved||saved.expires<Date.now())return res.status(400).json({error:"ثبت Face ID منقضی شده است"});
+  const v=await verifyRegistrationResponse({response:req.body,expectedChallenge:saved.challenge,expectedOrigin:ORIGIN,expectedRPID:RP_ID,requireUserVerification:true});
+  if(!v.verified||!v.registrationInfo)return res.status(400).json({error:"ثبت Passkey ناموفق بود"});
+  const c=v.registrationInfo.credential;await q("INSERT INTO passkeys(id,user_id,public_key,counter,transports) VALUES($1,$2,$3,$4,$5)",[c.id,req.user.sub,Buffer.from(c.publicKey),c.counter,c.transports||[]]);passkeyChallenges.delete(key);res.json({ok:true});
+ }catch(e){console.error("Passkey registration failed",e.message);res.status(400).json({error:"ثبت Face ID انجام نشد"})}
+});
+app.post("/api/auth/passkey/options",async(req,res)=>{
+ const email=cleanEmail(req.body.email),u=await q("SELECT id FROM users WHERE email=$1 AND active=true",[email]);
+ if(!u.rowCount)return res.status(404).json({error:"ایمیل پیدا نشد"});
+ const creds=await q("SELECT id,transports FROM passkeys WHERE user_id=$1",[u.rows[0].id]);if(!creds.rowCount)return res.status(404).json({error:"برای این حساب Passkey ثبت نشده است"});
+ const options=await generateAuthenticationOptions({rpID:RP_ID,userVerification:"required",allowCredentials:creds.rows.map(x=>({id:x.id,transports:x.transports}))});passkeyChallenges.set("auth:"+email,{challenge:options.challenge,userId:u.rows[0].id,expires:Date.now()+300000});res.json(options);
+});
+app.post("/api/auth/passkey/login",async(req,res)=>{
+ try{const email=cleanEmail(req.body.email),saved=passkeyChallenges.get("auth:"+email);if(!saved||saved.expires<Date.now())return res.status(400).json({error:"درخواست Face ID منقضی شده است"});
+  const r=await q("SELECT * FROM passkeys WHERE user_id=$1",[saved.userId]);let match;for(const c of r.rows){if(c.id===req.body.id){match=c;break}}if(!match)return res.status(401).json({error:"Passkey معتبر نیست"});
+  const v=await verifyAuthenticationResponse({response:req.body,expectedChallenge:saved.challenge,expectedOrigin:ORIGIN,expectedRPID:RP_ID,requireUserVerification:true,credential:{id:match.id,publicKey:new Uint8Array(match.public_key),counter:Number(match.counter),transports:match.transports}});if(!v.verified)return res.status(401).json({error:"تأیید Face ID ناموفق بود"});const u=await q("SELECT * FROM users WHERE id=$1 AND active=true",[saved.userId]);if(!u.rowCount)return res.status(401).json({error:"حساب غیرفعال است"});await q("UPDATE passkeys SET counter=$1 WHERE id=$2",[v.authenticationInfo.newCounter,match.id]);passkeyChallenges.delete("auth:"+email);res.json({token:sign(u.rows[0]),user:publicUser(u.rows[0])});
+ }catch(e){console.error("Passkey authentication failed",e.message);res.status(401).json({error:"ورود با Face ID ناموفق بود"})}
 });
 app.get("/api/me",auth,async(req,res)=>{const r=await q("SELECT * FROM users WHERE id=$1 AND active=true",[req.user.sub]);if(!r.rowCount)return res.status(401).json({error:"حساب غیرفعال است"});res.json(publicUser(r.rows[0]))});
 app.get("/api/transactions",auth,async(req,res)=>{

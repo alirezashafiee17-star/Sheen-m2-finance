@@ -34,7 +34,7 @@ const RP_ID=process.env.PASSKEY_RP_ID||"www.sheenfinance.ir";
 const ORIGIN=process.env.PASSKEY_ORIGIN||"https://www.sheenfinance.ir";
 const passkeyUserID=id=>new Uint8Array(Buffer.from(id.replace(/-/g,""),"hex"));
 const cleanEmail=v=>String(v||"").trim().toLowerCase();
-const publicUser=u=>({id:u.id,name:u.name,email:u.email,role:u.role});
+const publicUser=u=>({id:u.id,name:u.name,email:u.email,role:u.role,financeAccess:u.role==="owner"||u.finance_access,showroomAccess:u.role==="owner"||u.showroom_access,showroomEdit:u.role==="owner"||u.showroom_edit});
 function sign(u){return jwt.sign({sub:u.id,email:u.email,role:u.role},JWT_SECRET,{expiresIn:"30d"})}
 async function init(){
  await q(`CREATE TABLE IF NOT EXISTS users(
@@ -66,16 +66,45 @@ async function init(){
   id TEXT PRIMARY KEY, user_id UUID NOT NULL REFERENCES users(id), public_key BYTEA NOT NULL,
   counter BIGINT NOT NULL DEFAULT 0, transports TEXT[] NOT NULL DEFAULT '{}', created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
  );`);
+ await q("ALTER TABLE users ADD COLUMN IF NOT EXISTS finance_access BOOLEAN NOT NULL DEFAULT TRUE");
+ await q("ALTER TABLE users ADD COLUMN IF NOT EXISTS showroom_access BOOLEAN NOT NULL DEFAULT FALSE");
+ await q("ALTER TABLE users ADD COLUMN IF NOT EXISTS showroom_edit BOOLEAN NOT NULL DEFAULT FALSE");
+ await q(`CREATE TABLE IF NOT EXISTS showroom_cars(
+  id UUID PRIMARY KEY, title TEXT NOT NULL, year TEXT NOT NULL DEFAULT '',
+  mileage BIGINT NOT NULL DEFAULT 0 CHECK(mileage>=0), paint TEXT NOT NULL DEFAULT '',
+  ownership TEXT NOT NULL CHECK(ownership IN ('owned','consignment')),
+  status TEXT NOT NULL DEFAULT 'available' CHECK(status IN ('available','reserved','inspection','sold','settled')),
+  asking_price BIGINT NOT NULL DEFAULT 0 CHECK(asking_price>=0),
+  owner_name TEXT NOT NULL DEFAULT '', notes TEXT NOT NULL DEFAULT '',
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+ ); CREATE TABLE IF NOT EXISTS showroom_leads(
+  id UUID PRIMARY KEY, car_id UUID REFERENCES showroom_cars(id) ON DELETE SET NULL,
+  customer_name TEXT NOT NULL, phone TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'followup' CHECK(status IN ('followup','visit','negotiation','won','lost')),
+  next_followup TIMESTAMPTZ, notes TEXT NOT NULL DEFAULT '',
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+ ); CREATE TABLE IF NOT EXISTS showroom_deals(
+  id UUID PRIMARY KEY, car_id UUID NOT NULL REFERENCES showroom_cars(id),
+  sale_amount BIGINT NOT NULL CHECK(sale_amount>=0),
+  acquisition_amount BIGINT NOT NULL CHECK(acquisition_amount>=0),
+  expense_amount BIGINT NOT NULL DEFAULT 0 CHECK(expense_amount>=0),
+  commission_amount BIGINT NOT NULL DEFAULT 0 CHECK(commission_amount>=0),
+  notes TEXT NOT NULL DEFAULT '', happened_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+ );`);
  const existing=await q("SELECT id FROM users WHERE email=$1",[OWNER_EMAIL]);
  const hash=await bcrypt.hash(OWNER_PASSWORD,12);
  if(!existing.rowCount) await q("INSERT INTO users(id,name,email,password_hash,role) VALUES($1,$2,$3,$4,'owner')",[crypto.randomUUID(),"علیرضا شفیعی",OWNER_EMAIL,hash]);
  else await q("UPDATE users SET role='owner',active=true,password_hash=$2,updated_at=NOW() WHERE email=$1",[OWNER_EMAIL,hash]);
 }
-function auth(req,res,next){
+async function auth(req,res,next){
  const token=(req.headers.authorization||"").replace(/^Bearer\s+/i,"");
- try{req.user=jwt.verify(token,JWT_SECRET);next()}catch{return res.status(401).json({error:"نیاز به ورود مجدد"})}
+ try{const payload=jwt.verify(token,JWT_SECRET);const r=await q("SELECT id,name,email,role,finance_access,showroom_access,showroom_edit FROM users WHERE id=$1 AND active=true",[payload.sub]);if(!r.rowCount)return res.status(401).json({error:"حساب غیرفعال است"});req.user={...r.rows[0],sub:r.rows[0].id};next()}catch{return res.status(401).json({error:"نیاز به ورود مجدد"})}
 }
 const allow=(...roles)=>(req,res,next)=>roles.includes(req.user.role)?next():res.status(403).json({error:"دسترسی کافی ندارید"});
+const finance=(req,res,next)=>req.user.role==="owner"||req.user.finance_access?next():res.status(403).json({error:"به بخش مالی دسترسی ندارید"});
+const showroom=(req,res,next)=>req.user.role==="owner"||req.user.showroom_access?next():res.status(403).json({error:"به بخش نمایشگاه دسترسی ندارید"});
+const showroomWrite=(req,res,next)=>req.user.role==="owner"||(req.user.showroom_access&&req.user.showroom_edit)?next():res.status(403).json({error:"مجوز ثبت و ویرایش نمایشگاه ندارید"});
 async function audit(user,action,target,data={}){await q("INSERT INTO audit_log(id,action,target,data,actor_id) VALUES($1,$2,$3,$4,$5)",[crypto.randomUUID(),action,target,JSON.stringify(data),user.sub]).catch(()=>{})}
 function periodOf(value){
  const d=new Date(value); if(Number.isNaN(d.getTime())) return null;
@@ -121,6 +150,7 @@ app.post("/api/auth/passkey/login",async(req,res)=>{
  }catch(e){console.error("Passkey authentication failed",e.message);res.status(401).json({error:"ورود با Face ID ناموفق بود"})}
 });
 app.get("/api/me",auth,async(req,res)=>{const r=await q("SELECT * FROM users WHERE id=$1 AND active=true",[req.user.sub]);if(!r.rowCount)return res.status(401).json({error:"حساب غیرفعال است"});res.json(publicUser(r.rows[0]))});
+app.use(["/api/transactions","/api/transaction-edits","/api/periods","/api/import"],auth,finance);
 app.get("/api/transactions",auth,async(req,res)=>{
  await closePastPeriods();
  const r=await q("SELECT id,kind,amount::text,description AS desc,happened_at AS date,period,actor_name AS \"actorName\",actor_email AS \"actorEmail\" FROM transactions ORDER BY happened_at DESC");
@@ -135,7 +165,7 @@ app.get("/api/transaction-edits",auth,async(req,res)=>{
  FROM transaction_edits ORDER BY edited_at ASC,id ASC`);
  res.json(r.rows.map(x=>({...x,beforeAmount:Number(x.beforeAmount),afterAmount:Number(x.afterAmount)})));
 });
-app.post("/api/transactions",auth,allow("owner","admin"),async(req,res)=>{
+app.post("/api/transactions",auth,allow("owner"),async(req,res)=>{
  const amount=Math.trunc(Number(req.body.amount)),kind=req.body.kind,desc=String(req.body.desc||"").trim(),date=new Date(req.body.date),period=periodOf(req.body.date);
  if(!amount||amount<1||!["income","expense","withdrawal"].includes(kind)||!desc||!period||Number.isNaN(date.getTime()))return res.status(400).json({error:"اطلاعات تراکنش کامل نیست"});
  const pr=await q("SELECT closed FROM periods WHERE period=$1",[period]);if(req.user.role!=="owner"&&period!==currentPeriod()&&pr.rows[0]?.closed!==false)return res.status(403).json({error:"این ماه بسته شده است"});
@@ -143,7 +173,7 @@ app.post("/api/transactions",auth,allow("owner","admin"),async(req,res)=>{
  await q("INSERT INTO transactions(id,kind,amount,description,happened_at,period,actor_id,actor_name,actor_email) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)",[id,kind,amount,desc,date.toISOString(),period,req.user.sub,u.rows[0].name,u.rows[0].email]);
  await audit(req.user,"create_transaction",id,{amount,kind,desc,date:req.body.date});res.status(201).json({id});
 });
-app.put("/api/transactions/:id",auth,allow("owner","admin"),async(req,res)=>{
+app.put("/api/transactions/:id",auth,allow("owner"),async(req,res)=>{
  const amount=Math.trunc(Number(req.body.amount)),kind=req.body.kind,desc=String(req.body.desc||"").trim(),date=new Date(req.body.date),period=periodOf(req.body.date);
  if(!Number.isSafeInteger(amount)||amount<1||!["income","expense","withdrawal"].includes(kind)||!desc||!period||Number.isNaN(date.getTime()))return res.status(400).json({error:"اطلاعات نامعتبر"});
  const client=await pool.connect();
@@ -168,26 +198,81 @@ app.put("/api/transactions/:id",auth,allow("owner","admin"),async(req,res)=>{
  finally{client.release()}
 });
 app.get("/api/periods",auth,async(req,res)=>{await closePastPeriods();const r=await q("SELECT period,closed FROM periods");res.json(Object.fromEntries(r.rows.map(x=>[x.period,x])))});
-app.get("/api/members",auth,allow("owner"),async(req,res)=>{const r=await q("SELECT id,name,email,role,active FROM users WHERE role<>'owner' ORDER BY created_at");res.json(r.rows)});
+app.get("/api/members",auth,allow("owner"),async(req,res)=>{const r=await q("SELECT id,name,email,role,active,finance_access AS \"financeAccess\",showroom_access AS \"showroomAccess\",showroom_edit AS \"showroomEdit\" FROM users WHERE role<>'owner' AND active=true ORDER BY created_at");res.json(r.rows)});
 app.post("/api/members",auth,allow("owner"),async(req,res)=>{
  const name=String(req.body.name||"").trim(),email=cleanEmail(req.body.email),role=req.body.role,password=String(req.body.password||"");
- if(!name||!/^\S+@\S+\.\S+$/.test(email)||!["admin","viewer"].includes(role)||password.length<8)return res.status(400).json({error:"نام، ایمیل و رمز حداقل ۸ حرف لازم است"});
+ const financeAccess=req.body.financeAccess===true,showroomAccess=req.body.showroomAccess===true,showroomEdit=showroomAccess&&req.body.showroomEdit===true;
+ if(!name||!/^\S+@\S+\.\S+$/.test(email)||!["admin","viewer"].includes(role)||password.length<8||!financeAccess&&!showroomAccess)return res.status(400).json({error:"نام، ایمیل، رمز حداقل ۸ حرف و یک بخش مجاز لازم است"});
  const hash=await bcrypt.hash(password,12),id=crypto.randomUUID();
- try{await q("INSERT INTO users(id,name,email,password_hash,role) VALUES($1,$2,$3,$4,$5)",[id,name,email,hash,role])}catch(e){if(e.code==="23505")return res.status(409).json({error:"این ایمیل قبلاً ثبت شده"});throw e}
- await audit(req.user,"add_member",email,{name,role});res.status(201).json({id});
+ try{await q("INSERT INTO users(id,name,email,password_hash,role,finance_access,showroom_access,showroom_edit) VALUES($1,$2,$3,$4,$5,$6,$7,$8)",[id,name,email,hash,role,financeAccess,showroomAccess,showroomEdit])}catch(e){if(e.code==="23505")return res.status(409).json({error:"این ایمیل قبلاً ثبت شده"});throw e}
+ await audit(req.user,"add_member",email,{name,role,financeAccess,showroomAccess,showroomEdit});res.status(201).json({id});
 });
 app.put("/api/members/:id",auth,allow("owner"),async(req,res)=>{
  const name=String(req.body.name||"").trim(),role=req.body.role,password=String(req.body.password||"");
- if(!name||!["admin","viewer"].includes(role))return res.status(400).json({error:"اطلاعات عضو نامعتبر است"});
- if(password){if(password.length<8)return res.status(400).json({error:"رمز باید حداقل ۸ حرف باشد"});await q("UPDATE users SET name=$1,role=$2,password_hash=$3,updated_at=NOW() WHERE id=$4 AND role<>'owner'",[name,role,await bcrypt.hash(password,12),req.params.id])}
- else await q("UPDATE users SET name=$1,role=$2,updated_at=NOW() WHERE id=$3 AND role<>'owner'",[name,role,req.params.id]);
- await audit(req.user,"update_member",req.params.id,{name,role});res.json({ok:true});
+ const financeAccess=req.body.financeAccess===true,showroomAccess=req.body.showroomAccess===true,showroomEdit=showroomAccess&&req.body.showroomEdit===true;
+ if(!name||!["admin","viewer"].includes(role)||!financeAccess&&!showroomAccess)return res.status(400).json({error:"نام و دسترسی به حداقل یک بخش لازم است"});
+ if(password&&password.length<8)return res.status(400).json({error:"رمز باید حداقل ۸ حرف باشد"});
+ const r=await q("UPDATE users SET name=$1,role=$2,finance_access=$3,showroom_access=$4,showroom_edit=$5,password_hash=COALESCE($6,password_hash),updated_at=NOW() WHERE id=$7 AND role<>'owner' RETURNING id",[name,role,financeAccess,showroomAccess,showroomEdit,password?await bcrypt.hash(password,12):null,req.params.id]);
+ if(!r.rowCount)return res.status(404).json({error:"عضو پیدا نشد"});
+ await audit(req.user,"update_member",req.params.id,{name,role,financeAccess,showroomAccess,showroomEdit});res.json({ok:true});
 });
 app.delete("/api/members/:id",auth,allow("owner"),async(req,res)=>{await q("UPDATE users SET active=false,updated_at=NOW() WHERE id=$1 AND role<>'owner'",[req.params.id]);await audit(req.user,"disable_member",req.params.id);res.json({ok:true})});
 app.post("/api/import",auth,allow("owner"),async(req,res)=>{
  const items=Array.isArray(req.body)?req.body.slice(0,5000):[];let count=0;
  for(const x of items){const amount=Math.trunc(Number(x.amount)),kind=x.kind,desc=String(x.desc||"").trim(),date=new Date(x.date),period=periodOf(x.date);if(!amount||!["income","expense","withdrawal"].includes(kind)||!desc||!period||Number.isNaN(date.getTime()))continue;const id=String(x.id||crypto.randomUUID()).replace(/[^a-f0-9-]/gi,"").slice(0,36);const safeId=/^[0-9a-f]{8}-/.test(id)?id:crypto.randomUUID();await q("INSERT INTO transactions(id,kind,amount,description,happened_at,period,actor_id,actor_name,actor_email) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT(id) DO NOTHING",[safeId,kind,amount,desc,date.toISOString(),period,req.user.sub,"مالک",OWNER_EMAIL]);count++}
  await audit(req.user,"import_transactions","bulk",{count});res.json({count});
+});
+const money=v=>Number.isSafeInteger(Number(v))&&Number(v)>=0?Number(v):null;
+const short=(v,max=250)=>String(v||"").trim().slice(0,max);
+const carFields=b=>({title:short(b.title,120),year:short(b.year,20),mileage:money(b.mileage),paint:short(b.paint,100),ownership:b.ownership,status:b.status,askingPrice:money(b.askingPrice),ownerName:short(b.ownerName,120),notes:short(b.notes,1000)});
+const carValid=c=>c.title&&c.mileage!==null&&c.askingPrice!==null&&["owned","consignment"].includes(c.ownership)&&["available","reserved","inspection","sold","settled"].includes(c.status);
+app.use("/api/showroom",auth,showroom);
+app.get("/api/showroom/cars",async(req,res)=>{
+ const r=await q('SELECT id,title,year,mileage::text,paint,ownership,status,asking_price::text AS "askingPrice",owner_name AS "ownerName",notes,created_at AS "createdAt" FROM showroom_cars ORDER BY created_at DESC');
+ res.json(r.rows.map(x=>({...x,mileage:Number(x.mileage),askingPrice:Number(x.askingPrice)})));
+});
+app.post("/api/showroom/cars",showroomWrite,async(req,res)=>{
+ const c=carFields(req.body);if(!carValid(c))return res.status(400).json({error:"اطلاعات خودرو کامل یا معتبر نیست"});
+ const id=crypto.randomUUID();await q("INSERT INTO showroom_cars(id,title,year,mileage,paint,ownership,status,asking_price,owner_name,notes) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)",[id,c.title,c.year,c.mileage,c.paint,c.ownership,c.status,c.askingPrice,c.ownerName,c.notes]);
+ await audit(req.user,"showroom_car_create",id);res.status(201).json({id});
+});
+app.put("/api/showroom/cars/:id",showroomWrite,async(req,res)=>{
+ const c=carFields(req.body);if(!carValid(c))return res.status(400).json({error:"اطلاعات خودرو معتبر نیست"});
+ const r=await q("UPDATE showroom_cars SET title=$1,year=$2,mileage=$3,paint=$4,ownership=$5,status=$6,asking_price=$7,owner_name=$8,notes=$9,updated_at=NOW() WHERE id=$10 RETURNING id",[c.title,c.year,c.mileage,c.paint,c.ownership,c.status,c.askingPrice,c.ownerName,c.notes,req.params.id]);
+ if(!r.rowCount)return res.status(404).json({error:"خودرو پیدا نشد"});await audit(req.user,"showroom_car_update",req.params.id);res.json({ok:true});
+});
+app.get("/api/showroom/leads",async(req,res)=>{
+ const r=await q('SELECT l.id,l.car_id AS "carId",c.title AS "carTitle",l.customer_name AS "customerName",l.phone,l.status,l.next_followup AS "nextFollowup",l.notes,l.created_at AS "createdAt" FROM showroom_leads l LEFT JOIN showroom_cars c ON c.id=l.car_id ORDER BY l.created_at DESC');res.json(r.rows);
+});
+app.post("/api/showroom/leads",showroomWrite,async(req,res)=>{
+ const name=short(req.body.customerName,120),phone=short(req.body.phone,40),status=req.body.status,carId=req.body.carId||null,notes=short(req.body.notes,1000),next=req.body.nextFollowup?new Date(req.body.nextFollowup):null;
+ if(!name||!["followup","visit","negotiation","won","lost"].includes(status)||next&&Number.isNaN(next.getTime()))return res.status(400).json({error:"اطلاعات مشتری معتبر نیست"});
+ if(carId){const car=await q("SELECT id FROM showroom_cars WHERE id=$1",[carId]);if(!car.rowCount)return res.status(400).json({error:"خودرو پیدا نشد"})}
+ const id=crypto.randomUUID();await q("INSERT INTO showroom_leads(id,car_id,customer_name,phone,status,next_followup,notes) VALUES($1,$2,$3,$4,$5,$6,$7)",[id,carId,name,phone,status,next,notes]);await audit(req.user,"showroom_lead_create",id);res.status(201).json({id});
+});
+app.put("/api/showroom/leads/:id",showroomWrite,async(req,res)=>{
+ const name=short(req.body.customerName,120),phone=short(req.body.phone,40),status=req.body.status,carId=req.body.carId||null,notes=short(req.body.notes,1000),next=req.body.nextFollowup?new Date(req.body.nextFollowup):null;
+ if(!name||!["followup","visit","negotiation","won","lost"].includes(status)||next&&Number.isNaN(next.getTime()))return res.status(400).json({error:"اطلاعات مشتری معتبر نیست"});
+ if(carId){const car=await q("SELECT id FROM showroom_cars WHERE id=$1",[carId]);if(!car.rowCount)return res.status(400).json({error:"خودرو پیدا نشد"})}
+ const r=await q("UPDATE showroom_leads SET car_id=$1,customer_name=$2,phone=$3,status=$4,next_followup=$5,notes=$6,updated_at=NOW() WHERE id=$7 RETURNING id",[carId,name,phone,status,next,notes,req.params.id]);if(!r.rowCount)return res.status(404).json({error:"مشتری پیدا نشد"});await audit(req.user,"showroom_lead_update",req.params.id);res.json({ok:true});
+});
+app.get("/api/showroom/deals",async(req,res)=>{
+ const r=await q('SELECT d.id,d.car_id AS "carId",c.title AS "carTitle",d.sale_amount::text AS "saleAmount",d.acquisition_amount::text AS "acquisitionAmount",d.expense_amount::text AS "expenseAmount",d.commission_amount::text AS "commissionAmount",d.notes,d.happened_at AS "happenedAt" FROM showroom_deals d JOIN showroom_cars c ON c.id=d.car_id ORDER BY d.happened_at DESC');
+ res.json(r.rows.map(x=>({...x,saleAmount:Number(x.saleAmount),acquisitionAmount:Number(x.acquisitionAmount),expenseAmount:Number(x.expenseAmount),commissionAmount:Number(x.commissionAmount)})));
+});
+app.post("/api/showroom/deals",showroomWrite,async(req,res)=>{
+ const carId=req.body.carId,sale=money(req.body.saleAmount),acquisition=money(req.body.acquisitionAmount),expense=money(req.body.expenseAmount),commission=money(req.body.commissionAmount),notes=short(req.body.notes,1000);
+ if(!carId||[sale,acquisition,expense,commission].some(x=>x===null))return res.status(400).json({error:"مبلغ‌های معامله معتبر نیست"});
+ const car=await q("SELECT id FROM showroom_cars WHERE id=$1",[carId]);if(!car.rowCount)return res.status(400).json({error:"خودرو پیدا نشد"});
+ const id=crypto.randomUUID();await q("INSERT INTO showroom_deals(id,car_id,sale_amount,acquisition_amount,expense_amount,commission_amount,notes) VALUES($1,$2,$3,$4,$5,$6,$7)",[id,carId,sale,acquisition,expense,commission,notes]);await audit(req.user,"showroom_deal_create",id);res.status(201).json({id});
+});
+app.put("/api/showroom/deals/:id",showroomWrite,async(req,res)=>{
+ const carId=req.body.carId,sale=money(req.body.saleAmount),acquisition=money(req.body.acquisitionAmount),expense=money(req.body.expenseAmount),commission=money(req.body.commissionAmount),notes=short(req.body.notes,1000);
+ if(!carId||[sale,acquisition,expense,commission].some(x=>x===null))return res.status(400).json({error:"مبلغ‌های معامله معتبر نیست"});
+ const car=await q("SELECT id FROM showroom_cars WHERE id=$1",[carId]);if(!car.rowCount)return res.status(400).json({error:"خودرو پیدا نشد"});
+ const old=await q("SELECT * FROM showroom_deals WHERE id=$1",[req.params.id]);if(!old.rowCount)return res.status(404).json({error:"معامله پیدا نشد"});
+ await q("UPDATE showroom_deals SET car_id=$1,sale_amount=$2,acquisition_amount=$3,expense_amount=$4,commission_amount=$5,notes=$6 WHERE id=$7",[carId,sale,acquisition,expense,commission,notes,req.params.id]);
+ await audit(req.user,"showroom_deal_update",req.params.id,{before:old.rows[0],after:{carId,sale,acquisition,expense,commission,notes}});res.json({ok:true});
 });
 app.use(express.static(path.join(__dirname)));
 app.get("*",(req,res)=>res.sendFile(path.join(__dirname,"index.html")));

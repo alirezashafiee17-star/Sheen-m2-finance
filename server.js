@@ -13,7 +13,7 @@ const app=express();
 app.set("trust proxy",1);
 app.use(helmet({contentSecurityPolicy:false}));
 app.use(compression());
-app.use(express.json({limit:"2mb"}));
+app.use(express.json({limit:"4mb"}));
 app.use("/api/auth",rateLimit({windowMs:15*60*1000,max:60,standardHeaders:true,legacyHeaders:false}));
 
 const PORT=Number(process.env.PORT||3000);
@@ -90,6 +90,14 @@ async function init(){
   expense_amount BIGINT NOT NULL DEFAULT 0 CHECK(expense_amount>=0),
   commission_amount BIGINT NOT NULL DEFAULT 0 CHECK(commission_amount>=0),
   notes TEXT NOT NULL DEFAULT '', happened_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+ ); CREATE TABLE IF NOT EXISTS showroom_photos(
+  id UUID PRIMARY KEY, car_id UUID NOT NULL REFERENCES showroom_cars(id) ON DELETE CASCADE,
+  mime TEXT NOT NULL CHECK(mime IN ('image/jpeg','image/png','image/webp')),
+  image BYTEA NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+ ); CREATE TABLE IF NOT EXISTS showroom_withdrawals(
+  id UUID PRIMARY KEY, amount BIGINT NOT NULL CHECK(amount>0), description TEXT NOT NULL,
+  happened_at TIMESTAMPTZ NOT NULL, actor_id UUID REFERENCES users(id),
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
  );`);
  const existing=await q("SELECT id FROM users WHERE email=$1",[OWNER_EMAIL]);
@@ -240,6 +248,48 @@ app.put("/api/showroom/cars/:id",showroomWrite,async(req,res)=>{
  const c=carFields(req.body);if(!carValid(c))return res.status(400).json({error:"اطلاعات خودرو معتبر نیست"});
  const r=await q("UPDATE showroom_cars SET title=$1,year=$2,mileage=$3,paint=$4,ownership=$5,status=$6,asking_price=$7,owner_name=$8,notes=$9,updated_at=NOW() WHERE id=$10 RETURNING id",[c.title,c.year,c.mileage,c.paint,c.ownership,c.status,c.askingPrice,c.ownerName,c.notes,req.params.id]);
  if(!r.rowCount)return res.status(404).json({error:"خودرو پیدا نشد"});await audit(req.user,"showroom_car_update",req.params.id);res.json({ok:true});
+});
+app.get("/api/showroom/photos",async(req,res)=>{
+ const r=await q("SELECT id,car_id AS \"carId\" FROM showroom_photos ORDER BY created_at");res.json(r.rows);
+});
+app.get("/api/showroom/photos/:id",async(req,res)=>{
+ const r=await q("SELECT mime,image FROM showroom_photos WHERE id=$1",[req.params.id]);if(!r.rowCount)return res.sendStatus(404);
+ res.set("Cache-Control","private, no-store").type(r.rows[0].mime).send(r.rows[0].image);
+});
+app.post("/api/showroom/cars/:id/photos",showroomWrite,async(req,res)=>{
+ const mime=String(req.body.mime||""),raw=String(req.body.data||"");
+ if(!["image/jpeg","image/png","image/webp"].includes(mime)||!raw||raw.length>2800000||!/^[A-Za-z0-9+/]+={0,2}$/.test(raw))return res.status(400).json({error:"عکس معتبر نیست یا بیش از حد بزرگ است"});
+ const image=Buffer.from(raw,"base64");
+ const valid=mime==="image/jpeg"?image[0]===255&&image[1]===216:mime==="image/png"?image.subarray(0,8).equals(Buffer.from("89504e470d0a1a0a","hex")):image.toString("ascii",0,4)==="RIFF"&&image.toString("ascii",8,12)==="WEBP";
+ if(!valid||image.length>2*1024*1024)return res.status(400).json({error:"فقط عکس JPG، PNG یا WebP تا ۲ مگابایت پذیرفته می‌شود"});
+ const client=await pool.connect();try{
+  await client.query("BEGIN");const car=await client.query("SELECT id FROM showroom_cars WHERE id=$1 FOR UPDATE",[req.params.id]);
+  if(!car.rowCount){await client.query("ROLLBACK");return res.sendStatus(404)}
+  const count=await client.query("SELECT count(*)::int AS n FROM showroom_photos WHERE car_id=$1",[req.params.id]);
+  if(count.rows[0].n>=5){await client.query("ROLLBACK");return res.status(400).json({error:"برای هر خودرو حداکثر ۵ عکس ثبت می‌شود"})}
+  const id=crypto.randomUUID();await client.query("INSERT INTO showroom_photos(id,car_id,mime,image) VALUES($1,$2,$3,$4)",[id,req.params.id,mime,image]);await client.query("COMMIT");
+  await audit(req.user,"showroom_photo_create",id,{carId:req.params.id});res.status(201).json({id});
+ }catch(e){await client.query("ROLLBACK").catch(()=>{});throw e}finally{client.release()}
+});
+app.delete("/api/showroom/photos/:id",showroomWrite,async(req,res)=>{
+ const r=await q("DELETE FROM showroom_photos WHERE id=$1 RETURNING car_id",[req.params.id]);if(!r.rowCount)return res.sendStatus(404);
+ await audit(req.user,"showroom_photo_delete",req.params.id,{carId:r.rows[0].car_id});res.json({ok:true});
+});
+app.get("/api/showroom/withdrawals",async(req,res)=>{
+ const r=await q('SELECT id,amount::text,description,happened_at AS "happenedAt" FROM showroom_withdrawals ORDER BY happened_at DESC,created_at DESC');
+ res.json(r.rows.map(x=>({...x,amount:Number(x.amount)})));
+});
+app.post("/api/showroom/withdrawals",showroomWrite,async(req,res)=>{
+ const amount=money(req.body.amount),description=short(req.body.description,1000),date=new Date(req.body.happenedAt);
+ if(!amount||!description||Number.isNaN(date.getTime()))return res.status(400).json({error:"مبلغ، تاریخ و توضیح برداشت لازم است"});
+ const id=crypto.randomUUID();await q("INSERT INTO showroom_withdrawals(id,amount,description,happened_at,actor_id) VALUES($1,$2,$3,$4,$5)",[id,amount,description,date.toISOString(),req.user.sub]);
+ await audit(req.user,"showroom_withdrawal_create",id,{amount,description});res.status(201).json({id});
+});
+app.put("/api/showroom/withdrawals/:id",showroomWrite,async(req,res)=>{
+ const amount=money(req.body.amount),description=short(req.body.description,1000),date=new Date(req.body.happenedAt);
+ if(!amount||!description||Number.isNaN(date.getTime()))return res.status(400).json({error:"مبلغ، تاریخ و توضیح برداشت لازم است"});
+ const r=await q("UPDATE showroom_withdrawals SET amount=$1,description=$2,happened_at=$3 WHERE id=$4 RETURNING id",[amount,description,date.toISOString(),req.params.id]);
+ if(!r.rowCount)return res.sendStatus(404);await audit(req.user,"showroom_withdrawal_update",req.params.id,{amount,description});res.json({ok:true});
 });
 app.get("/api/showroom/leads",async(req,res)=>{
  const r=await q('SELECT l.id,l.car_id AS "carId",c.title AS "carTitle",l.customer_name AS "customerName",l.phone,l.status,l.next_followup AS "nextFollowup",l.notes,l.created_at AS "createdAt" FROM showroom_leads l LEFT JOIN showroom_cars c ON c.id=l.car_id ORDER BY l.created_at DESC');res.json(r.rows);

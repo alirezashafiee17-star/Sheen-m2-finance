@@ -34,7 +34,7 @@ const RP_ID=process.env.PASSKEY_RP_ID||"www.sheenfinance.ir";
 const ORIGIN=process.env.PASSKEY_ORIGIN||"https://www.sheenfinance.ir";
 const passkeyUserID=id=>new Uint8Array(Buffer.from(id.replace(/-/g,""),"hex"));
 const cleanEmail=v=>String(v||"").trim().toLowerCase();
-const publicUser=u=>({id:u.id,name:u.name,email:u.email,role:u.role,financeAccess:u.role==="owner"||u.finance_access,showroomAccess:u.role==="owner"||u.showroom_access,showroomEdit:u.role==="owner"||u.showroom_edit});
+const publicUser=u=>({id:u.id,name:u.name,email:u.email,role:u.role,displayTitle:u.role==="owner"?"مالک":u.display_title,financeEdit:u.role==="owner"||(u.finance_access&&u.finance_edit),financeAccess:u.role==="owner"||u.finance_access,showroomAccess:u.role==="owner"||u.showroom_access,showroomEdit:u.role==="owner"||u.showroom_edit});
 function sign(u){return jwt.sign({sub:u.id,email:u.email,role:u.role},JWT_SECRET,{expiresIn:"30d"})}
 async function init(){
  await q(`CREATE TABLE IF NOT EXISTS users(
@@ -67,6 +67,8 @@ async function init(){
   counter BIGINT NOT NULL DEFAULT 0, transports TEXT[] NOT NULL DEFAULT '{}', created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
  );`);
  await q("ALTER TABLE users ADD COLUMN IF NOT EXISTS finance_access BOOLEAN NOT NULL DEFAULT TRUE");
+ await q("ALTER TABLE users ADD COLUMN IF NOT EXISTS finance_edit BOOLEAN NOT NULL DEFAULT TRUE");
+ await q("ALTER TABLE users ADD COLUMN IF NOT EXISTS display_title TEXT NOT NULL DEFAULT 'عضو'");
  await q("ALTER TABLE users ADD COLUMN IF NOT EXISTS showroom_access BOOLEAN NOT NULL DEFAULT FALSE");
  await q("ALTER TABLE users ADD COLUMN IF NOT EXISTS showroom_edit BOOLEAN NOT NULL DEFAULT FALSE");
  await q(`CREATE TABLE IF NOT EXISTS showroom_cars(
@@ -107,10 +109,11 @@ async function init(){
 }
 async function auth(req,res,next){
  const token=(req.headers.authorization||"").replace(/^Bearer\s+/i,"");
- try{const payload=jwt.verify(token,JWT_SECRET);const r=await q("SELECT id,name,email,role,finance_access,showroom_access,showroom_edit FROM users WHERE id=$1 AND active=true",[payload.sub]);if(!r.rowCount)return res.status(401).json({error:"حساب غیرفعال است"});req.user={...r.rows[0],sub:r.rows[0].id};next()}catch{return res.status(401).json({error:"نیاز به ورود مجدد"})}
+ try{const payload=jwt.verify(token,JWT_SECRET);const r=await q("SELECT id,name,email,role,display_title,finance_access,finance_edit,showroom_access,showroom_edit FROM users WHERE id=$1 AND active=true",[payload.sub]);if(!r.rowCount)return res.status(401).json({error:"حساب غیرفعال است"});req.user={...r.rows[0],sub:r.rows[0].id};next()}catch{return res.status(401).json({error:"نیاز به ورود مجدد"})}
 }
 const allow=(...roles)=>(req,res,next)=>roles.includes(req.user.role)?next():res.status(403).json({error:"دسترسی کافی ندارید"});
 const finance=(req,res,next)=>req.user.role==="owner"||req.user.finance_access?next():res.status(403).json({error:"به بخش مالی دسترسی ندارید"});
+const financeWrite=(req,res,next)=>req.user.role==="owner"||(req.user.finance_access&&req.user.finance_edit)?next():res.status(403).json({error:"اجازهٔ ثبت و ویرایش مالی ندارید"});
 const showroom=(req,res,next)=>req.user.role==="owner"||req.user.showroom_access?next():res.status(403).json({error:"به بخش نمایشگاه دسترسی ندارید"});
 const showroomWrite=(req,res,next)=>req.user.role==="owner"||(req.user.showroom_access&&req.user.showroom_edit)?next():res.status(403).json({error:"مجوز ثبت و ویرایش نمایشگاه ندارید"});
 async function audit(user,action,target,data={}){await q("INSERT INTO audit_log(id,action,target,data,actor_id) VALUES($1,$2,$3,$4,$5)",[crypto.randomUUID(),action,target,JSON.stringify(data),user.sub]).catch(()=>{})}
@@ -173,7 +176,7 @@ app.get("/api/transaction-edits",auth,async(req,res)=>{
  FROM transaction_edits ORDER BY edited_at ASC,id ASC`);
  res.json(r.rows.map(x=>({...x,beforeAmount:Number(x.beforeAmount),afterAmount:Number(x.afterAmount)})));
 });
-app.post("/api/transactions",auth,allow("owner"),async(req,res)=>{
+app.post("/api/transactions",auth,financeWrite,async(req,res)=>{
  const amount=Math.trunc(Number(req.body.amount)),kind=req.body.kind,desc=String(req.body.desc||"").trim(),date=new Date(req.body.date),period=periodOf(req.body.date);
  if(!amount||amount<1||!["income","expense","withdrawal"].includes(kind)||!desc||!period||Number.isNaN(date.getTime()))return res.status(400).json({error:"اطلاعات تراکنش کامل نیست"});
  const pr=await q("SELECT closed FROM periods WHERE period=$1",[period]);if(req.user.role!=="owner"&&period!==currentPeriod()&&pr.rows[0]?.closed!==false)return res.status(403).json({error:"این ماه بسته شده است"});
@@ -181,7 +184,7 @@ app.post("/api/transactions",auth,allow("owner"),async(req,res)=>{
  await q("INSERT INTO transactions(id,kind,amount,description,happened_at,period,actor_id,actor_name,actor_email) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)",[id,kind,amount,desc,date.toISOString(),period,req.user.sub,u.rows[0].name,u.rows[0].email]);
  await audit(req.user,"create_transaction",id,{amount,kind,desc,date:req.body.date});res.status(201).json({id});
 });
-app.put("/api/transactions/:id",auth,allow("owner"),async(req,res)=>{
+app.put("/api/transactions/:id",auth,financeWrite,async(req,res)=>{
  const amount=Math.trunc(Number(req.body.amount)),kind=req.body.kind,desc=String(req.body.desc||"").trim(),date=new Date(req.body.date),period=periodOf(req.body.date);
  if(!Number.isSafeInteger(amount)||amount<1||!["income","expense","withdrawal"].includes(kind)||!desc||!period||Number.isNaN(date.getTime()))return res.status(400).json({error:"اطلاعات نامعتبر"});
  const client=await pool.connect();
@@ -206,23 +209,23 @@ app.put("/api/transactions/:id",auth,allow("owner"),async(req,res)=>{
  finally{client.release()}
 });
 app.get("/api/periods",auth,async(req,res)=>{await closePastPeriods();const r=await q("SELECT period,closed FROM periods");res.json(Object.fromEntries(r.rows.map(x=>[x.period,x])))});
-app.get("/api/members",auth,allow("owner"),async(req,res)=>{const r=await q("SELECT id,name,email,role,active,finance_access AS \"financeAccess\",showroom_access AS \"showroomAccess\",showroom_edit AS \"showroomEdit\" FROM users WHERE role<>'owner' AND active=true ORDER BY created_at");res.json(r.rows)});
+app.get("/api/members",auth,allow("owner"),async(req,res)=>{const r=await q("SELECT id,name,email,role,display_title AS \"displayTitle\",active,finance_access AS \"financeAccess\",finance_edit AS \"financeEdit\",showroom_access AS \"showroomAccess\",showroom_edit AS \"showroomEdit\" FROM users WHERE role<>'owner' AND active=true ORDER BY created_at");res.json(r.rows)});
 app.post("/api/members",auth,allow("owner"),async(req,res)=>{
  const name=String(req.body.name||"").trim(),email=cleanEmail(req.body.email),role=req.body.role,password=String(req.body.password||"");
- const financeAccess=req.body.financeAccess===true,showroomAccess=req.body.showroomAccess===true,showroomEdit=showroomAccess&&req.body.showroomEdit===true;
- if(!name||!/^\S+@\S+\.\S+$/.test(email)||!["admin","viewer"].includes(role)||password.length<8||!financeAccess&&!showroomAccess)return res.status(400).json({error:"نام، ایمیل، رمز حداقل ۸ حرف و یک بخش مجاز لازم است"});
+ const financeAccess=req.body.financeAccess===true,financeEdit=financeAccess&&req.body.financeEdit===true,showroomAccess=req.body.showroomAccess===true,showroomEdit=showroomAccess&&req.body.showroomEdit===true,displayTitle=req.body.displayTitle;
+ if(!name||!/^\S+@\S+\.\S+$/.test(email)||!["admin","viewer"].includes(role)||!["عضو","مدیر","کارمند"].includes(displayTitle)||password.length<8||!financeAccess&&!showroomAccess)return res.status(400).json({error:"نام، ایمیل، رمز حداقل ۸ حرف و یک بخش مجاز لازم است"});
  const hash=await bcrypt.hash(password,12),id=crypto.randomUUID();
- try{await q("INSERT INTO users(id,name,email,password_hash,role,finance_access,showroom_access,showroom_edit) VALUES($1,$2,$3,$4,$5,$6,$7,$8)",[id,name,email,hash,role,financeAccess,showroomAccess,showroomEdit])}catch(e){if(e.code==="23505")return res.status(409).json({error:"این ایمیل قبلاً ثبت شده"});throw e}
- await audit(req.user,"add_member",email,{name,role,financeAccess,showroomAccess,showroomEdit});res.status(201).json({id});
+ try{await q("INSERT INTO users(id,name,email,password_hash,role,display_title,finance_access,finance_edit,showroom_access,showroom_edit) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)",[id,name,email,hash,role,displayTitle,financeAccess,financeEdit,showroomAccess,showroomEdit])}catch(e){if(e.code==="23505")return res.status(409).json({error:"این ایمیل قبلاً ثبت شده"});throw e}
+ await audit(req.user,"add_member",email,{name,role,displayTitle,financeAccess,financeEdit,showroomAccess,showroomEdit});res.status(201).json({id});
 });
 app.put("/api/members/:id",auth,allow("owner"),async(req,res)=>{
  const name=String(req.body.name||"").trim(),role=req.body.role,password=String(req.body.password||"");
- const financeAccess=req.body.financeAccess===true,showroomAccess=req.body.showroomAccess===true,showroomEdit=showroomAccess&&req.body.showroomEdit===true;
- if(!name||!["admin","viewer"].includes(role)||!financeAccess&&!showroomAccess)return res.status(400).json({error:"نام و دسترسی به حداقل یک بخش لازم است"});
+ const financeAccess=req.body.financeAccess===true,financeEdit=financeAccess&&req.body.financeEdit===true,showroomAccess=req.body.showroomAccess===true,showroomEdit=showroomAccess&&req.body.showroomEdit===true,displayTitle=req.body.displayTitle;
+ if(!name||!["admin","viewer"].includes(role)||!["عضو","مدیر","کارمند"].includes(displayTitle)||!financeAccess&&!showroomAccess)return res.status(400).json({error:"نام و دسترسی به حداقل یک بخش لازم است"});
  if(password&&password.length<8)return res.status(400).json({error:"رمز باید حداقل ۸ حرف باشد"});
- const r=await q("UPDATE users SET name=$1,role=$2,finance_access=$3,showroom_access=$4,showroom_edit=$5,password_hash=COALESCE($6,password_hash),updated_at=NOW() WHERE id=$7 AND role<>'owner' RETURNING id",[name,role,financeAccess,showroomAccess,showroomEdit,password?await bcrypt.hash(password,12):null,req.params.id]);
+ const r=await q("UPDATE users SET name=$1,role=$2,display_title=$3,finance_access=$4,finance_edit=$5,showroom_access=$6,showroom_edit=$7,password_hash=COALESCE($8,password_hash),updated_at=NOW() WHERE id=$9 AND role<>'owner' RETURNING id",[name,role,displayTitle,financeAccess,financeEdit,showroomAccess,showroomEdit,password?await bcrypt.hash(password,12):null,req.params.id]);
  if(!r.rowCount)return res.status(404).json({error:"عضو پیدا نشد"});
- await audit(req.user,"update_member",req.params.id,{name,role,financeAccess,showroomAccess,showroomEdit});res.json({ok:true});
+ await audit(req.user,"update_member",req.params.id,{name,role,displayTitle,financeAccess,financeEdit,showroomAccess,showroomEdit});res.json({ok:true});
 });
 app.delete("/api/members/:id",auth,allow("owner"),async(req,res)=>{await q("UPDATE users SET active=false,updated_at=NOW() WHERE id=$1 AND role<>'owner'",[req.params.id]);await audit(req.user,"disable_member",req.params.id);res.json({ok:true})});
 app.post("/api/import",auth,allow("owner"),async(req,res)=>{

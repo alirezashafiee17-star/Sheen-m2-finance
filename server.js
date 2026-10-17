@@ -104,8 +104,8 @@ async function init(){
  );`);
  await q(`CREATE TABLE IF NOT EXISTS showroom_agencies(
   id UUID PRIMARY KEY, car_id UUID NOT NULL REFERENCES showroom_cars(id),
-  version INTEGER NOT NULL DEFAULT 1, status TEXT NOT NULL DEFAULT 'awaiting_signature'
-   CHECK(status IN ('awaiting_signature','expired','superseded','signed')),
+  version INTEGER NOT NULL DEFAULT 1, status TEXT NOT NULL DEFAULT 'draft'
+   CHECK(status IN ('draft','expired','superseded','signed')),
   owner_name TEXT NOT NULL, owner_national_id TEXT NOT NULL, owner_phone TEXT NOT NULL,
   car_snapshot JSONB NOT NULL, net_price BIGINT NOT NULL CHECK(net_price>=0),
   commission TEXT NOT NULL DEFAULT '', settlement TEXT NOT NULL DEFAULT '',
@@ -251,16 +251,8 @@ const carFields=b=>({title:short(b.title,120),year:short(b.year,20),mileage:mone
 const carValid=c=>c.title&&c.mileage!==null&&c.askingPrice!==null&&["owned","consignment"].includes(c.ownership)&&["available","reserved","inspection","sold","settled"].includes(c.status);
 app.use("/api/showroom",auth,showroom);
 const agencyTokenHash=token=>crypto.createHash("sha256").update(token).digest("hex");
-const agencyPublicLimit=rateLimit({windowMs:15*60*1000,max:30,standardHeaders:true,legacyHeaders:false});
-app.get("/api/agency/:token",agencyPublicLimit,async(req,res)=>{
- const token=String(req.params.token||"");if(!/^[a-f0-9]{64}$/.test(token))return res.sendStatus(404);
- const r=await q("SELECT id,car_snapshot,owner_name,net_price::text,commission,settlement,authority,terms,version,status,expires_at FROM showroom_agencies WHERE token_hash=$1",[agencyTokenHash(token)]);
- if(!r.rowCount)return res.sendStatus(404);
- const a=r.rows[0];if(a.status!=="awaiting_signature"||new Date(a.expires_at)<=new Date())return res.status(410).json({error:"این لینک منقضی شده یا اعتبار ندارد"});
- res.set("Cache-Control","no-store");res.json({car:a.car_snapshot,ownerName:a.owner_name,netPrice:a.net_price,commission:a.commission,settlement:a.settlement,authority:a.authority,terms:a.terms,version:a.version,expiresAt:a.expires_at,signatureAvailable:false});
-});
 app.get("/api/showroom/agencies",async(req,res)=>{
- const r=await q('SELECT a.id,a.car_id AS "carId",c.title AS "carTitle",a.version,a.status,a.owner_name AS "ownerName",a.owner_phone AS "ownerPhone",a.net_price::text AS "netPrice",a.expires_at AS "expiresAt",a.created_at AS "createdAt" FROM showroom_agencies a JOIN showroom_cars c ON c.id=a.car_id ORDER BY a.created_at DESC');res.json(r.rows);
+ const r=await q('SELECT a.id,a.car_id AS "carId",c.title AS "carTitle",a.version,a.status,a.owner_name AS "ownerName",a.net_price::text AS "netPrice",a.expires_at AS "expiresAt",a.created_at AS "createdAt" FROM showroom_agencies a JOIN showroom_cars c ON c.id=a.car_id ORDER BY a.created_at DESC');res.json(r.rows);
 });
 app.post("/api/showroom/agencies",showroomWrite,async(req,res)=>{
  const {carId,ownerName,ownerNationalId,ownerPhone,commission,settlement,authority,terms}=req.body||{};
@@ -270,12 +262,12 @@ app.post("/api/showroom/agencies",showroomWrite,async(req,res)=>{
   await client.query("BEGIN");const car=await client.query("SELECT id,title,year,mileage,paint,ownership,asking_price,owner_name FROM showroom_cars WHERE id=$1 FOR UPDATE",[carId]);
   if(!car.rowCount||car.rows[0].ownership!=="consignment"){await client.query("ROLLBACK");return res.status(400).json({error:"نیابت فقط برای خودروی امانی ثبت می‌شود"})}
   const prior=await client.query("SELECT COALESCE(MAX(version),0)+1 AS version FROM showroom_agencies WHERE car_id=$1",[carId]);
-  await client.query("UPDATE showroom_agencies SET status='superseded' WHERE car_id=$1 AND status='awaiting_signature'",[carId]);
+  await client.query("UPDATE showroom_agencies SET status='superseded' WHERE car_id=$1 AND status='draft'",[carId]);
   token=crypto.randomBytes(32).toString("hex");id=crypto.randomUUID();
   await client.query("INSERT INTO showroom_agencies(id,car_id,version,owner_name,owner_national_id,owner_phone,car_snapshot,net_price,commission,settlement,authority,terms,token_hash,expires_at,created_by) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,NOW()+($14::int * INTERVAL '1 day'),$15)",[id,carId,prior.rows[0].version,String(ownerName).trim(),ownerNationalId,ownerPhone,JSON.stringify(car.rows[0]),netPrice,String(commission||"").slice(0,1000),String(settlement).slice(0,1000),String(authority).slice(0,1000),String(terms||"").slice(0,5000),agencyTokenHash(token),days,req.user.sub]);
   await client.query("COMMIT");
  }catch(e){await client.query("ROLLBACK").catch(()=>{});throw e}finally{client.release()}
- await audit(req.user,"showroom_agency_create",id,{carId});res.status(201).json({id,link:`${ORIGIN}/agency.html#${token}`});
+ await audit(req.user,"showroom_agency_create",id,{carId});res.status(201).json({id});
 });
 app.get("/api/showroom/cars",async(req,res)=>{
  const r=await q('SELECT id,title,year,mileage::text,paint,ownership,status,asking_price::text AS "askingPrice",owner_name AS "ownerName",notes,created_at AS "createdAt" FROM showroom_cars ORDER BY created_at DESC');

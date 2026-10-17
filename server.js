@@ -102,6 +102,41 @@ async function init(){
   happened_at TIMESTAMPTZ NOT NULL, actor_id UUID REFERENCES users(id),
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
  );`);
+ await q(`CREATE TABLE IF NOT EXISTS showroom_agencies(
+  id UUID PRIMARY KEY, car_id UUID NOT NULL REFERENCES showroom_cars(id),
+  version INTEGER NOT NULL DEFAULT 1, status TEXT NOT NULL DEFAULT 'draft'
+   CHECK(status IN ('draft','expired','superseded','signed','owner_submitted','approved','revision_requested')),
+  owner_name TEXT NOT NULL, owner_national_id TEXT NOT NULL, owner_phone TEXT NOT NULL,
+  car_snapshot JSONB NOT NULL, net_price BIGINT NOT NULL CHECK(net_price>=0),
+  commission TEXT NOT NULL DEFAULT '', settlement TEXT NOT NULL DEFAULT '',
+  authority TEXT NOT NULL DEFAULT '', terms TEXT NOT NULL DEFAULT '',
+  token_hash TEXT NOT NULL UNIQUE, expires_at TIMESTAMPTZ NOT NULL,
+  created_by UUID REFERENCES users(id), created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  signed_at TIMESTAMPTZ, provider_reference TEXT
+ ); CREATE INDEX IF NOT EXISTS showroom_agencies_car_idx ON showroom_agencies(car_id,created_at DESC);`);
+ await q(`CREATE TABLE IF NOT EXISTS showroom_agency_documents(
+  id UUID PRIMARY KEY, agency_id UUID NOT NULL REFERENCES showroom_agencies(id) ON DELETE CASCADE,
+  kind TEXT NOT NULL CHECK(kind IN ('vehicle','national_front','national_back','power_of_attorney')),
+  mime TEXT NOT NULL CHECK(mime IN ('image/jpeg','image/png','image/webp','application/pdf')),
+  content BYTEA NOT NULL, sha256 TEXT NOT NULL,
+  review_status TEXT NOT NULL DEFAULT 'pending' CHECK(review_status IN ('pending','approved','revision_requested')),
+  review_note TEXT NOT NULL DEFAULT '', reviewed_by UUID REFERENCES users(id), reviewed_at TIMESTAMPTZ,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), UNIQUE(agency_id,kind)
+ ); CREATE INDEX IF NOT EXISTS showroom_agency_documents_agency_idx ON showroom_agency_documents(agency_id);`);
+ await q("ALTER TABLE showroom_agencies DROP CONSTRAINT IF EXISTS showroom_agencies_status_check");
+ await q("ALTER TABLE showroom_agencies ADD CONSTRAINT showroom_agencies_status_check CHECK(status IN ('draft','expired','superseded','signed','owner_submitted','approved','revision_requested'))");
+ await q("ALTER TABLE showroom_agencies ADD COLUMN IF NOT EXISTS owner_submitted_at TIMESTAMPTZ");
+ await q("ALTER TABLE showroom_agencies ADD COLUMN IF NOT EXISTS reviewed_at TIMESTAMPTZ");
+ await q("ALTER TABLE showroom_agencies ADD COLUMN IF NOT EXISTS reviewed_by UUID REFERENCES users(id)");
+ await q("ALTER TABLE showroom_agencies ADD COLUMN IF NOT EXISTS revision_note TEXT NOT NULL DEFAULT ''");
+ await q("ALTER TABLE showroom_agencies ADD COLUMN IF NOT EXISTS owner_correction TEXT NOT NULL DEFAULT ''");
+ await q("ALTER TABLE showroom_agencies ADD COLUMN IF NOT EXISTS accepted_digest TEXT");
+ await q("ALTER TABLE showroom_agencies ADD COLUMN IF NOT EXISTS owner_declared_name TEXT");
+ await q("ALTER TABLE showroom_agencies ADD COLUMN IF NOT EXISTS owner_declared_phone TEXT");
+ await q("ALTER TABLE showroom_agencies ADD COLUMN IF NOT EXISTS owner_declared_national_id TEXT");
+ await q("ALTER TABLE showroom_agencies ADD COLUMN IF NOT EXISTS link_issued_at TIMESTAMPTZ");
+ await q("ALTER TABLE showroom_agency_documents DROP CONSTRAINT IF EXISTS showroom_agency_documents_kind_check");
+ await q("ALTER TABLE showroom_agency_documents ADD CONSTRAINT showroom_agency_documents_kind_check CHECK(kind IN ('vehicle','national_front','national_back','power_of_attorney','contract_page_1','contract_page_2'))");
  const existing=await q("SELECT id FROM users WHERE email=$1",[OWNER_EMAIL]);
  const hash=await bcrypt.hash(OWNER_PASSWORD,12);
  if(!existing.rowCount) await q("INSERT INTO users(id,name,email,password_hash,role) VALUES($1,$2,$3,$4,'owner')",[crypto.randomUUID(),"علیرضا شفیعی",OWNER_EMAIL,hash]);
@@ -238,6 +273,158 @@ const short=(v,max=250)=>String(v||"").trim().slice(0,max);
 const carFields=b=>({title:short(b.title,120),year:short(b.year,20),mileage:money(b.mileage),paint:short(b.paint,100),ownership:b.ownership,status:b.status,askingPrice:money(b.askingPrice),ownerName:short(b.ownerName,120),notes:short(b.notes,1000)});
 const carValid=c=>c.title&&c.mileage!==null&&c.askingPrice!==null&&["owned","consignment"].includes(c.ownership)&&["available","reserved","inspection","sold","settled"].includes(c.status);
 app.use("/api/showroom",auth,showroom);
+const agencyTokenHash=token=>crypto.createHash("sha256").update(token).digest("hex");
+app.get("/api/showroom/agencies",async(req,res)=>{
+ const r=await q('SELECT a.id,a.car_id AS "carId",c.title AS "carTitle",a.version,a.status,a.owner_name AS "ownerName",a.net_price::text AS "netPrice",a.expires_at AS "expiresAt",a.created_at AS "createdAt",a.owner_submitted_at AS "ownerSubmittedAt",a.revision_note AS "revisionNote",a.owner_correction AS "ownerCorrection",a.owner_declared_name AS "declaredName",a.owner_declared_phone AS "declaredPhone",a.owner_declared_national_id AS "declaredNationalId",a.commission,a.settlement,a.authority,a.terms,a.accepted_digest AS "acceptedDigest" FROM showroom_agencies a JOIN showroom_cars c ON c.id=a.car_id ORDER BY a.created_at DESC');res.json(r.rows);
+});
+app.post("/api/showroom/agencies",showroomWrite,async(req,res)=>{
+ const {carId,ownerName,ownerNationalId,ownerPhone,commission,settlement,authority,terms}=req.body||{};
+ const netPrice=Number(req.body?.netPrice),days=Number(req.body?.validDays||6);
+ if(!carId||!String(ownerName||"").trim()||!/^[0-9]{10}$/.test(String(ownerNationalId||""))||!/^09[0-9]{9}$/.test(String(ownerPhone||""))||!Number.isSafeInteger(netPrice)||netPrice<0||!Number.isInteger(days)||days<1||days>30||!String(authority||"").trim()||!String(settlement||"").trim())return res.status(400).json({error:"مشخصات مالک و شرایط قرارداد را کامل کنید"});
+ const client=await pool.connect();let token,id;try{
+  await client.query("BEGIN");const car=await client.query("SELECT id,title,year,mileage,paint,ownership,asking_price,owner_name FROM showroom_cars WHERE id=$1 FOR UPDATE",[carId]);
+  if(!car.rowCount||car.rows[0].ownership!=="consignment"){await client.query("ROLLBACK");return res.status(400).json({error:"نیابت فقط برای خودروی امانی ثبت می‌شود"})}
+  const prior=await client.query("SELECT COALESCE(MAX(version),0)+1 AS version FROM showroom_agencies WHERE car_id=$1",[carId]);
+  await client.query("UPDATE showroom_agencies SET status='superseded' WHERE car_id=$1 AND status IN ('draft','revision_requested')",[carId]);
+  token=crypto.randomBytes(32).toString("hex");id=crypto.randomUUID();
+  await client.query("INSERT INTO showroom_agencies(id,car_id,version,owner_name,owner_national_id,owner_phone,car_snapshot,net_price,commission,settlement,authority,terms,token_hash,expires_at,created_by) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,NOW()+($14::int * INTERVAL '1 day'),$15)",[id,carId,prior.rows[0].version,String(ownerName).trim(),ownerNationalId,ownerPhone,JSON.stringify(car.rows[0]),netPrice,String(commission||"").slice(0,1000),String(settlement).slice(0,1000),String(authority).slice(0,1000),String(terms||"").slice(0,5000),agencyTokenHash(token),days,req.user.sub]);
+  await client.query("COMMIT");
+ }catch(e){await client.query("ROLLBACK").catch(()=>{});throw e}finally{client.release()}
+ await audit(req.user,"showroom_agency_create",id,{carId});res.status(201).json({id});
+});
+const agencyDocumentKinds=new Set(["vehicle","national_front","national_back","power_of_attorney","contract_page_1","contract_page_2"]);
+const agencyDocumentMimes=new Set(["image/jpeg","image/png","image/webp","application/pdf"]);
+const ownerUploadKinds=new Set(["vehicle","national_front","national_back","power_of_attorney"]);
+const ownerLimiter=rateLimit({windowMs:15*60*1000,max:50,standardHeaders:true,legacyHeaders:false});
+app.use("/api/owner-agency",ownerLimiter);
+async function auditOwner(action,agencyId,data={}){
+ await q("INSERT INTO audit_log(id,action,target,data) VALUES($1,$2,$3,$4)",[crypto.randomUUID(),action,agencyId,JSON.stringify(data)]);
+}
+async function ownerAgency(req,res,next){
+ const token=String(req.headers["x-agency-token"]||"");
+ if(!/^[a-f0-9]{64}$/.test(token))return res.sendStatus(404);
+ const r=await q("SELECT * FROM showroom_agencies WHERE token_hash=$1 AND expires_at>NOW() AND status IN ('draft','revision_requested','owner_submitted')",[agencyTokenHash(token)]);
+ if(!r.rowCount)return res.sendStatus(404);
+ req.agency=r.rows[0];next();
+}
+app.post("/api/showroom/agencies/:id/owner-link",showroomWrite,async(req,res)=>{
+ const docs=await q("SELECT kind FROM showroom_agency_documents WHERE agency_id=$1 AND kind IN ('contract_page_1','contract_page_2')",[req.params.id]);
+ if(docs.rowCount!==2)return res.status(409).json({error:"ابتدا هر دو صفحهٔ نیابت‌نامهٔ وکیل را بارگذاری کنید"});
+ const token=crypto.randomBytes(32).toString("hex");
+ const r=await q("UPDATE showroom_agencies SET token_hash=$2,link_issued_at=COALESCE(link_issued_at,NOW()) WHERE id=$1 AND status IN ('draft','revision_requested') AND owner_correction='' AND expires_at>NOW() RETURNING id",[req.params.id,agencyTokenHash(token)]);
+ if(!r.rowCount)return res.status(409).json({error:"درخواست قابل ارسال نیست"});
+ await audit(req.user,"showroom_agency_link_issued",req.params.id);
+ res.set("Cache-Control","no-store").json({url:"/agency.html#"+token});
+});
+app.post("/api/showroom/agencies/:id/revoke-link",showroomWrite,async(req,res)=>{
+ const r=await q("UPDATE showroom_agencies SET token_hash=$2,expires_at=NOW() WHERE id=$1 RETURNING id",[req.params.id,agencyTokenHash(crypto.randomBytes(32).toString("hex"))]);
+ if(!r.rowCount)return res.sendStatus(404);
+ await audit(req.user,"showroom_agency_link_revoked",req.params.id);res.json({ok:true});
+});
+app.get("/api/owner-agency",ownerAgency,async(req,res)=>{
+ const a=req.agency;
+ const docs=await q("SELECT kind,review_status AS status,review_note AS note FROM showroom_agency_documents WHERE agency_id=$1",[a.id]);
+ res.set("Cache-Control","no-store").json({car:a.car_snapshot,version:a.version,netPrice:String(a.net_price),commission:a.commission,settlement:a.settlement,authority:a.authority,terms:a.terms,status:a.status,revisionNote:a.revision_note,expiresAt:a.expires_at,documents:docs.rows});
+});
+app.get("/api/owner-agency/contract/:page",ownerAgency,async(req,res)=>{
+ if(!["1","2"].includes(req.params.page))return res.sendStatus(404);
+ const r=await q("SELECT mime,content FROM showroom_agency_documents WHERE agency_id=$1 AND kind=$2",[req.agency.id,"contract_page_"+req.params.page]);
+ if(!r.rowCount)return res.sendStatus(404);
+ res.set({"Content-Type":r.rows[0].mime,"Cache-Control":"no-store","X-Content-Type-Options":"nosniff"}).send(r.rows[0].content);
+});
+app.put("/api/owner-agency/document/:kind",ownerAgency,async(req,res)=>{
+ const {kind}=req.params,{mime,data}=req.body||{};
+ if(!ownerUploadKinds.has(kind)||!agencyDocumentMimes.has(mime)||typeof data!=="string"||!/^([A-Za-z0-9+/]{4})*([A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(data))return res.status(400).json({error:"فایل نامعتبر است"});
+ const bytes=Buffer.from(data,"base64");
+ if(!bytes.length||bytes.length>2*1024*1024||!validDocumentBytes(mime,bytes))return res.status(400).json({error:"حداکثر حجم ۲ مگابایت؛ تصویر یا PDF معتبر"});
+ if(req.agency.status==="owner_submitted")return res.status(409).json({error:"درخواست ثبت شده است"});
+ const hash=crypto.createHash("sha256").update(bytes).digest("hex");
+ await q(`INSERT INTO showroom_agency_documents(id,agency_id,kind,mime,content,sha256) VALUES($1,$2,$3,$4,$5,$6)
+ ON CONFLICT(agency_id,kind) DO UPDATE SET mime=EXCLUDED.mime,content=EXCLUDED.content,sha256=EXCLUDED.sha256,review_status='pending',review_note='',reviewed_by=NULL,reviewed_at=NULL,created_at=NOW()`,[crypto.randomUUID(),req.agency.id,kind,mime,bytes,hash]);
+ await auditOwner("showroom_agency_owner_document_upload",req.agency.id,{kind,sha256:hash});
+ res.json({ok:true});
+});
+app.post("/api/owner-agency/correction",ownerAgency,async(req,res)=>{
+ const note=short(req.body?.note,1000);if(!note)return res.status(400).json({error:"توضیح اصلاح لازم است"});
+ const result=await q("UPDATE showroom_agencies SET owner_correction=$2,status='revision_requested' WHERE id=$1 AND status IN ('draft','revision_requested') RETURNING id",[req.agency.id,note]);
+ if(!result.rowCount)return res.status(409).json({error:"این درخواست قبلاً ثبت شده است"});
+ await auditOwner("showroom_agency_owner_correction",req.agency.id);res.json({ok:true});
+});
+app.post("/api/owner-agency/submit",ownerAgency,async(req,res)=>{
+ if(req.agency.status==="owner_submitted")return res.status(409).json({error:"قبلاً ثبت شده است"});
+ if(req.agency.owner_correction)return res.status(409).json({error:"برای این درخواست اصلاح ثبت شده است؛ منتظر نسخهٔ جدید باشید"});
+ const {name,phone,nationalId,hasPowerOfAttorney,accepted}=req.body||{};
+ if(accepted!==true||!short(name,120)||!/^09[0-9]{9}$/.test(String(phone||""))||!/^[0-9]{10}$/.test(String(nationalId||"")))return res.status(400).json({error:"اطلاعات و پذیرش شرایط را کامل کنید"});
+ if(phone!==req.agency.owner_phone||nationalId!==req.agency.owner_national_id)return res.status(400).json({error:"کد ملی و شماره همراه با مشخصات ثبت‌شدهٔ مالک مطابقت ندارد"});
+ const docs=await q("SELECT kind,sha256 FROM showroom_agency_documents WHERE agency_id=$1",[req.agency.id]);
+ const map=new Map(docs.rows.map(x=>[x.kind,x.sha256]));
+ if(["vehicle","national_front","national_back","contract_page_1","contract_page_2",...(hasPowerOfAttorney?["power_of_attorney"]:[])].some(k=>!map.has(k)))return res.status(409).json({error:"مدارک الزامی و دو صفحهٔ نیابت‌نامه باید کامل باشند"});
+ const digest=crypto.createHash("sha256").update(JSON.stringify({version:req.agency.version,car:req.agency.car_snapshot,price:String(req.agency.net_price),commission:req.agency.commission,settlement:req.agency.settlement,authority:req.agency.authority,terms:req.agency.terms,documents:[...map.entries()].sort()})).digest("hex");
+ const r=await q("UPDATE showroom_agencies SET status='owner_submitted',owner_submitted_at=NOW(),owner_declared_name=$2,owner_declared_phone=$3,owner_declared_national_id=$4,accepted_digest=$5,owner_correction='' WHERE id=$1 AND status IN ('draft','revision_requested') RETURNING id,owner_submitted_at",[req.agency.id,short(name,120),phone,nationalId,digest]);
+ if(!r.rowCount)return res.status(409).json({error:"وضعیت پرونده تغییر کرده است"});
+ await auditOwner("showroom_agency_owner_submit",req.agency.id,{version:req.agency.version,digest});
+ res.set("Cache-Control","no-store").json({reference:r.rows[0].id,submittedAt:r.rows[0].owner_submitted_at,version:req.agency.version,digest});
+});
+app.post("/api/showroom/agencies/:id/final-review",showroomWrite,async(req,res)=>{
+ const status=req.body?.approved===true?"approved":"revision_requested",note=short(req.body?.note,1000);
+ if(status==="revision_requested"&&!note)return res.status(400).json({error:"دلیل اصلاح لازم است"});
+ const client=await pool.connect();
+ try{await client.query("BEGIN");
+  const a=await client.query("SELECT status FROM showroom_agencies WHERE id=$1 FOR UPDATE",[req.params.id]);
+  if(a.rows[0]?.status!=="owner_submitted"){await client.query("ROLLBACK");return res.status(409).json({error:"تأیید مالک ثبت نشده است"})}
+  if(status==="approved"){
+   const docs=await client.query("SELECT kind,review_status FROM showroom_agency_documents WHERE agency_id=$1",[req.params.id]);
+   const map=new Map(docs.rows.map(x=>[x.kind,x.review_status]));
+   if(["vehicle","national_front","national_back"].some(k=>map.get(k)!=="approved")||[...map.entries()].some(([kind,s])=>kind==="power_of_attorney"&&s!=="approved")){await client.query("ROLLBACK");return res.status(409).json({error:"ابتدا مدارک هویتی و مالکیت را تأیید کنید"})}
+  }
+  await client.query("UPDATE showroom_agencies SET status=$2,revision_note=$3,reviewed_by=$4,reviewed_at=NOW(),token_hash=CASE WHEN $2='approved' THEN $5 ELSE token_hash END WHERE id=$1",[req.params.id,status,note,req.user.sub,agencyTokenHash(crypto.randomBytes(32).toString("hex"))]);
+  await client.query("COMMIT");
+ }catch(e){await client.query("ROLLBACK").catch(()=>{});throw e}finally{client.release()}
+ await audit(req.user,"showroom_agency_final_review",req.params.id,{status});res.json({ok:true,status});
+});
+function validDocumentBytes(mime,bytes){
+ if(mime==="image/jpeg")return bytes[0]===0xff&&bytes[1]===0xd8&&bytes[2]===0xff;
+ if(mime==="image/png")return bytes.subarray(0,8).equals(Buffer.from("89504e470d0a1a0a","hex"));
+ if(mime==="image/webp")return bytes.toString("ascii",0,4)==="RIFF"&&bytes.toString("ascii",8,12)==="WEBP";
+ if(mime==="application/pdf")return bytes.toString("ascii",0,5)==="%PDF-";
+ return false;
+}
+app.get("/api/showroom/agencies/:id/documents",async(req,res)=>{
+ const agency=await q("SELECT id FROM showroom_agencies WHERE id=$1",[req.params.id]);
+ if(!agency.rowCount)return res.sendStatus(404);
+ const rows=await q('SELECT id,kind,mime,sha256,review_status AS "reviewStatus",review_note AS "reviewNote",created_at AS "createdAt",reviewed_at AS "reviewedAt" FROM showroom_agency_documents WHERE agency_id=$1 ORDER BY created_at',[req.params.id]);
+ res.set("Cache-Control","no-store").json(rows.rows);
+});
+app.get("/api/showroom/agencies/:id/documents/:kind",async(req,res)=>{
+ if(!agencyDocumentKinds.has(req.params.kind))return res.sendStatus(404);
+ const row=await q("SELECT mime,content FROM showroom_agency_documents WHERE agency_id=$1 AND kind=$2",[req.params.id,req.params.kind]);
+ if(!row.rowCount)return res.sendStatus(404);
+ res.set({"Content-Type":row.rows[0].mime,"Content-Disposition":"attachment; filename=document."+({"image/jpeg":"jpg","image/png":"png","image/webp":"webp","application/pdf":"pdf"}[row.rows[0].mime]),"Cache-Control":"no-store","X-Content-Type-Options":"nosniff"}).send(row.rows[0].content);
+});
+app.put("/api/showroom/agencies/:id/documents/:kind",showroomWrite,async(req,res)=>{
+ const {kind,id}=req.params,{mime,data}=req.body||{};
+ if(!agencyDocumentKinds.has(kind)||!agencyDocumentMimes.has(mime)||typeof data!=="string"||!/^([A-Za-z0-9+/]{4})*([A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(data))return res.status(400).json({error:"فایل یا نوع مدرک معتبر نیست"});
+ const bytes=Buffer.from(data,"base64");
+ if(!bytes.length||bytes.length>2*1024*1024||!validDocumentBytes(mime,bytes))return res.status(400).json({error:"فایل باید تصویر یا PDF معتبر، حداکثر ۲ مگابایت باشد"});
+ const agency=await q("SELECT status FROM showroom_agencies WHERE id=$1",[id]);
+ if(!agency.rowCount)return res.sendStatus(404);
+ if(!["draft","revision_requested"].includes(agency.rows[0].status))return res.status(409).json({error:"مدارک این نسخه قابل تغییر نیست"});
+ if(kind.startsWith("contract_page_")){
+  const issued=await q("SELECT link_issued_at FROM showroom_agencies WHERE id=$1",[id]);
+  if(issued.rows[0].link_issued_at)return res.status(409).json({error:"متن نیابت‌نامه پس از صدور لینک قفل است؛ نسخهٔ تازه بسازید"});
+ }
+ const hash=crypto.createHash("sha256").update(bytes).digest("hex");
+ await q(`INSERT INTO showroom_agency_documents(id,agency_id,kind,mime,content,sha256) VALUES($1,$2,$3,$4,$5,$6)
+  ON CONFLICT(agency_id,kind) DO UPDATE SET mime=EXCLUDED.mime,content=EXCLUDED.content,sha256=EXCLUDED.sha256,review_status='pending',review_note='',reviewed_by=NULL,reviewed_at=NULL,created_at=NOW()`,[crypto.randomUUID(),id,kind,mime,bytes,hash]);
+ await audit(req.user,"showroom_agency_document_upload",id,{kind,sha256:hash});res.json({ok:true});
+});
+app.patch("/api/showroom/agencies/:id/documents/:kind/review",showroomWrite,async(req,res)=>{
+ const {kind,id}=req.params,{status,note}=req.body||{};
+ if(!agencyDocumentKinds.has(kind)||!["approved","revision_requested"].includes(status)||status==="revision_requested"&&!String(note||"").trim())return res.status(400).json({error:"نتیجه و توضیح بررسی را وارد کنید"});
+ const result=await q("UPDATE showroom_agency_documents SET review_status=$3,review_note=$4,reviewed_by=$5,reviewed_at=NOW() WHERE agency_id=$1 AND kind=$2 AND EXISTS(SELECT 1 FROM showroom_agencies WHERE id=$1 AND status IN ('draft','owner_submitted','revision_requested')) RETURNING id",[id,kind,status,String(note||"").trim().slice(0,500),req.user.sub]);
+ if(!result.rowCount)return res.status(404).json({error:"مدرک قابل بررسی پیدا نشد"});
+ await audit(req.user,"showroom_agency_document_review",id,{kind,status});res.json({ok:true});
+});
 app.get("/api/showroom/cars",async(req,res)=>{
  const r=await q('SELECT id,title,year,mileage::text,paint,ownership,status,asking_price::text AS "askingPrice",owner_name AS "ownerName",notes,created_at AS "createdAt" FROM showroom_cars ORDER BY created_at DESC');
  res.json(r.rows.map(x=>({...x,mileage:Number(x.mileage),askingPrice:Number(x.askingPrice)})));
@@ -327,7 +514,10 @@ app.put("/api/showroom/deals/:id",showroomWrite,async(req,res)=>{
  await q("UPDATE showroom_deals SET car_id=$1,sale_amount=$2,acquisition_amount=$3,expense_amount=$4,commission_amount=$5,notes=$6 WHERE id=$7",[carId,sale,acquisition,expense,commission,notes,req.params.id]);
  await audit(req.user,"showroom_deal_update",req.params.id,{before:old.rows[0],after:{carId,sale,acquisition,expense,commission,notes}});res.json({ok:true});
 });
-app.use(express.static(path.join(__dirname)));
+// Serve only browser assets. Never expose server source, archives or local files.
+for(const asset of ["index.html","agency.html","app.js","showroom.js"]){
+ app.get("/"+asset,(req,res)=>res.sendFile(path.join(__dirname,asset)));
+}
 app.get("*",(req,res)=>res.sendFile(path.join(__dirname,"index.html")));
 app.listen(PORT,"0.0.0.0",()=>console.log("Sheen Finance ready on",PORT));
 async function connectDatabase(){

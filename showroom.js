@@ -1,4 +1,4 @@
-let showroomCars=[],showroomLeads=[],showroomDeals=[],showroomWithdrawals=[],showroomPhotos=[],showroomPhotoUrls=new Map(),showroomTab="cars",showroomEditing=null;
+let showroomCars=[],showroomLeads=[],showroomDeals=[],showroomWithdrawals=[],showroomAgencies=[],showroomPhotos=[],showroomPhotoUrls=new Map(),showroomTab="cars",showroomEditing=null;
 const carStatus={available:"موجود",reserved:"رزرو",inspection:"در حال کارشناسی",sold:"فروخته‌شده",settled:"تسویه‌شده"};
 const leadStatus={followup:"پیگیری",visit:"هماهنگی بازدید",negotiation:"مذاکره",won:"خرید انجام شد",lost:"انصراف"};
 const ownerType={owned:"خرید نمایشگاه",consignment:"امانی"};
@@ -17,14 +17,14 @@ function showModule(module){
 }
 window.showModule=showModule;
 async function loadShowroom(){
- [showroomCars,showroomLeads,showroomDeals,showroomWithdrawals,showroomPhotos]=await Promise.all([api("/showroom/cars"),api("/showroom/leads"),api("/showroom/deals"),api("/showroom/withdrawals"),api("/showroom/photos")]);
+ [showroomCars,showroomLeads,showroomDeals,showroomWithdrawals,showroomAgencies,showroomPhotos]=await Promise.all([api("/showroom/cars"),api("/showroom/leads"),api("/showroom/deals"),api("/showroom/withdrawals"),api("/showroom/agencies"),api("/showroom/photos")]);
  renderShowroom();await loadShowroomPhotos();
 }
 window.loadShowroom=loadShowroom;
 function renderShowroom(){
  const available=showroomCars.filter(c=>c.status==="available").length;
  $("#showroomMetrics").innerHTML=[["خودروهای موجود",available],["مشتری‌ها",showroomLeads.length],["معامله‌ها",showroomDeals.length]].map(([label,value])=>`<div class="metric"><div class="label">${label}</div><div class="value">${new Intl.NumberFormat("fa-IR").format(value)}</div></div>`).join("");
- const titles={cars:"پروندهٔ خودروها",leads:"مشتری‌ها و پیگیری‌ها",deals:"معامله‌ها و سود نمایشگاه",withdrawals:"برداشت‌های نمایشگاه",report:"سند مالی نمایشگاه"};
+ const titles={cars:"پروندهٔ خودروها",leads:"مشتری‌ها و پیگیری‌ها",deals:"معامله‌ها و سود نمایشگاه",agencies:"نیابت‌های فروش خودرو",withdrawals:"برداشت‌های نمایشگاه",report:"سند مالی نمایشگاه"};
  $("#showroomTitle").textContent=titles[showroomTab];
  $("#showroomAdd").style.display=currentUser?.showroomEdit&&showroomTab!=="report"?"":"none";
  $("#showroomListPanel").hidden=showroomTab==="report";$("#showroomReport").hidden=showroomTab!=="report";$("#showroomPrintActions").hidden=showroomTab!=="report";
@@ -34,6 +34,7 @@ function renderShowroom(){
  if(showroomTab==="leads")html=showroomLeads.map(l=>`<div class="showroom-row"><div><strong>${esc(l.customerName)}</strong><small>${esc(l.carTitle||"بدون خودرو")} · ${esc(leadStatus[l.status])}<br>${l.nextFollowup?"پیگیری: "+fmtDate(l.nextFollowup):"زمان پیگیری تعیین نشده"} ${l.phone?" · "+esc(l.phone):""}</small></div>${currentUser.showroomEdit?`<button class="edit" data-lead="${l.id}">ویرایش</button>`:""}</div>`).join("");
  if(showroomTab==="deals")html=showroomDeals.map(d=>`<div class="showroom-row"><div><strong>${esc(d.carTitle)}</strong><small>فروش ${toman(d.saleAmount)} · خرید/تسویه ${toman(d.acquisitionAmount)}<br>هزینه ${toman(d.expenseAmount)} · کمیسیون جداگانه ${toman(d.commissionAmount)}<br>سود نمایشگاه: ${toman(d.saleAmount-d.acquisitionAmount-d.expenseAmount+d.commissionAmount)}</small></div>${currentUser.showroomEdit?`<button class="edit" data-deal="${d.id}">ویرایش</button>`:""}</div>`).join("");
  if(showroomTab==="withdrawals")html=showroomWithdrawals.map(w=>`<div class="showroom-row"><div><strong>${toman(w.amount)}</strong><small>${fmtDate(w.happenedAt)} · ${esc(w.description)}</small></div>${currentUser.showroomEdit?`<button class="edit" data-withdrawal="${w.id}">ویرایش</button>`:""}</div>`).join("");
+ if(showroomTab==="agencies")html='<div class="period-note">لینک فقط برای بررسی متن است؛ تأیید نهایی تا اتصال احراز مالک و امضای الکترونیکی فعال نیست.</div>'+showroomAgencies.map(a=>`<div class="showroom-row"><div><strong>${esc(a.carTitle)} · نسخهٔ ${esc(a.version)}</strong><small>مالک: ${esc(a.ownerName)} · قیمت خالص: ${toman(a.netPrice)}<br>${a.status==="superseded"?"نسخهٔ جایگزین صادر شد":new Date(a.expiresAt)<new Date()?"منقضی‌شده":"در انتظار امضا"} · اعتبار تا ${fmtDate(a.expiresAt)}</small></div></div>`).join("");
  if(showroomTab==="report")renderShowroomReport();
  $("#showroomRows").innerHTML=html||'<div class="empty">هنوز موردی ثبت نشده است.</div>';
  $$("[data-car]").forEach(b=>b.onclick=()=>openShowroom("cars",showroomCars.find(c=>c.id===b.dataset.car)));
@@ -47,22 +48,23 @@ function carOptions(value){return [["","انتخاب خودرو"],...showroomCar
 function openShowroom(type,item=null){
  if(!currentUser?.showroomEdit)return;
  showroomEditing=item;showroomTab=type;
- $("#showroomModalTitle").textContent=(item?"ویرایش ":"ثبت ")+({cars:"خودرو",leads:"مشتری",deals:"معامله",withdrawals:"برداشت"}[type]);
+ $("#showroomModalTitle").textContent=(item?"ویرایش ":"ثبت ")+({cars:"خودرو",leads:"مشتری",deals:"معامله",agencies:"درخواست نیابت فروش",withdrawals:"برداشت"}[type]);
  let fields="";
  if(type==="cars")fields=fld("title","نام خودرو",item?.title,"text","required maxlength=120")+fld("year","مدل سال",item?.year)+fld("mileage","کارکرد کیلومتر",item?.mileage||0,"number","required min=0")+fld("paint","وضعیت رنگ و بدنه",item?.paint)+sel("ownership","نوع مالکیت",Object.entries(ownerType),item?.ownership||"consignment")+sel("status","وضعیت",Object.entries(carStatus),item?.status||"available")+fld("askingPrice","قیمت پیشنهادی (تومان)",item?.askingPrice||0,"number","required min=0")+fld("ownerName","نام مالک خودرو",item?.ownerName)+fld("notes","توضیحات",item?.notes);
  if(type==="leads")fields=fld("customerName","نام مشتری",item?.customerName,"text","required")+fld("phone","شماره تماس",item?.phone,"tel")+ `<label class="field">خودروی موردنظر<select name="carId">${carOptions(item?.carId||"")}</select></label>`+sel("status","وضعیت پیگیری",Object.entries(leadStatus),item?.status||"followup")+fld("nextFollowup","زمان پیگیری بعدی",item?.nextFollowup?localDT(item.nextFollowup):"","datetime-local")+fld("notes","توضیحات",item?.notes);
  if(type==="withdrawals")fields=fld("amount","مبلغ برداشت (تومان)",item?.amount||"","number","required min=1")+fld("happenedAt","تاریخ و ساعت",item?.happenedAt?localDT(item.happenedAt):localDT(),"datetime-local","required")+fld("description","توضیح برداشت",item?.description||"","text","required maxlength=1000");
  if(type==="deals")fields=`<label class="field">خودرو<select name="carId" required>${carOptions(item?.carId||"")}</select></label>`+fld("saleAmount","مبلغ فروش (تومان)",item?.saleAmount||0,"number","required min=0")+fld("acquisitionAmount","قیمت خرید یا تسویه با مالک (تومان)",item?.acquisitionAmount||0,"number","required min=0")+fld("expenseAmount","هزینه‌ها (تومان)",item?.expenseAmount||0,"number","required min=0")+fld("commissionAmount","کمیسیون دریافتی جداگانه (تومان)",item?.commissionAmount||0,"number","required min=0")+fld("notes","توضیحات",item?.notes||"");
+ if(type==="agencies")fields=`<div class="period-note">فقط خودروهای امانی. ثبت نسخهٔ جدید، لینک قبلی را باطل می‌کند. ارسال پیامک و امضای نهایی هنوز فعال نیست.</div><label class="field">خودروی امانی<select name="carId" required>${[["","انتخاب خودرو"],...showroomCars.filter(c=>c.ownership==="consignment").map(c=>[c.id,c.title+" "+c.year])].map(([id,title])=>`<option value="${esc(id)}">${esc(title)}</option>`).join("")}</select></label>`+fld("ownerName","نام مالک","","text","required")+fld("ownerNationalId","کد ملی مالک","","text","required inputmode=numeric pattern=[0-9]{10}")+fld("ownerPhone","شماره موبایل مالک","","tel","required pattern=09[0-9]{9}")+fld("netPrice","قیمت خالص مالک (تومان)","","number","required min=0")+fld("validDays","مدت اعتبار (روز)",6,"number","required min=1 max=30")+fld("commission","کمیسیون")+fld("settlement","نحوه و زمان تسویه","","text","required")+fld("authority","حدود اختیار فروش","فقط مطابق شرایط مورد تأیید مالک","text","required")+`<label class="field">شرایط تکمیلی<textarea name="terms" maxlength="5000"></textarea></label>`;
  $("#showroomForm").innerHTML=fields+(type==="cars"&&item?`<label class="field">افزودن عکس (تا ۵ عکس، هر کدام حداکثر ۲ مگابایت)<input id="carPhotoInput" type="file" accept="image/jpeg,image/png,image/webp" multiple></label><div id="photoManager" class="photo-manager"></div>`:type==="cars"?'<small class="money-hint">پس از ذخیرهٔ خودرو می‌توانید عکس‌های آن را اضافه کنید.</small>':"")+'<button class="primary save" type="submit">ذخیره</button>';
  $("#showroomModal").showModal();
  if(type==="cars"&&item){renderPhotoManager(item.id);$("#carPhotoInput").onchange=e=>uploadCarPhotos(item.id,e.target.files)}
 }
 $("#showroomForm").onsubmit=async e=>{
  e.preventDefault();const data=Object.fromEntries(new FormData(e.target));
- for(const key of ["mileage","askingPrice","saleAmount","acquisitionAmount","expenseAmount","commissionAmount","amount"])if(key in data)data[key]=Number(data[key]);
+ for(const key of ["mileage","askingPrice","saleAmount","acquisitionAmount","expenseAmount","commissionAmount","amount","netPrice","validDays"])if(key in data)data[key]=Number(data[key]);
  if(data.nextFollowup)data.nextFollowup=new Date(data.nextFollowup).toISOString();
  if(data.happenedAt)data.happenedAt=new Date(data.happenedAt).toISOString();
- try{const type=showroomTab,wasNew=!showroomEditing,result=await api("/showroom/"+type+(showroomEditing?"/"+showroomEditing.id:""),{method:showroomEditing?"PUT":"POST",body:JSON.stringify(data)});$("#showroomModal").close();await loadShowroom();if(type==="cars"&&wasNew)openShowroom("cars",showroomCars.find(c=>c.id===result.id));toast(wasNew&&type==="cars"?"خودرو ذخیره شد؛ عکس‌های آن را اضافه کنید":"اطلاعات نمایشگاه ذخیره شد")}catch(error){toast(error.message)}
+ try{const type=showroomTab,wasNew=!showroomEditing,result=await api("/showroom/"+type+(showroomEditing?"/"+showroomEditing.id:""),{method:showroomEditing?"PUT":"POST",body:JSON.stringify(data)});$("#showroomModal").close();await loadShowroom();if(type==="cars"&&wasNew)openShowroom("cars",showroomCars.find(c=>c.id===result.id));if(type==="agencies"){try{await navigator.clipboard.writeText(result.link);toast("درخواست ثبت و لینک بررسی کپی شد؛ امضای نهایی فعال نیست")}catch{prompt("لینک محرمانهٔ بررسی مالک",result.link)}}else toast(wasNew&&type==="cars"?"خودرو ذخیره شد؛ عکس‌های آن را اضافه کنید":"اطلاعات نمایشگاه ذخیره شد")}catch(error){toast(error.message)}
 };
 $("#closeShowroom").onclick=()=>$("#showroomModal").close();
 $("#showroomAdd").onclick=()=>openShowroom(showroomTab);

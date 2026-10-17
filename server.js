@@ -346,7 +346,8 @@ app.put("/api/owner-agency/document/:kind",ownerAgency,async(req,res)=>{
 });
 app.post("/api/owner-agency/correction",ownerAgency,async(req,res)=>{
  const note=short(req.body?.note,1000);if(!note)return res.status(400).json({error:"توضیح اصلاح لازم است"});
- await q("UPDATE showroom_agencies SET owner_correction=$2,status='revision_requested' WHERE id=$1 AND status IN ('draft','revision_requested')",[req.agency.id,note]);
+ const result=await q("UPDATE showroom_agencies SET owner_correction=$2,status='revision_requested' WHERE id=$1 AND status IN ('draft','revision_requested') RETURNING id",[req.agency.id,note]);
+ if(!result.rowCount)return res.status(409).json({error:"این درخواست قبلاً ثبت شده است"});
  await auditOwner("showroom_agency_owner_correction",req.agency.id);res.json({ok:true});
 });
 app.post("/api/owner-agency/submit",ownerAgency,async(req,res)=>{
@@ -513,7 +514,10 @@ app.put("/api/showroom/deals/:id",showroomWrite,async(req,res)=>{
  await q("UPDATE showroom_deals SET car_id=$1,sale_amount=$2,acquisition_amount=$3,expense_amount=$4,commission_amount=$5,notes=$6 WHERE id=$7",[carId,sale,acquisition,expense,commission,notes,req.params.id]);
  await audit(req.user,"showroom_deal_update",req.params.id,{before:old.rows[0],after:{carId,sale,acquisition,expense,commission,notes}});res.json({ok:true});
 });
-app.use(express.static(path.join(__dirname)));
+// Serve only browser assets. Never expose server source, archives or local files.
+for(const asset of ["index.html","agency.html","app.js","showroom.js"]){
+ app.get("/"+asset,(req,res)=>res.sendFile(path.join(__dirname,asset)));
+}
 app.get("*",(req,res)=>res.sendFile(path.join(__dirname,"index.html")));
 app.listen(PORT,"0.0.0.0",()=>console.log("Sheen Finance ready on",PORT));
 async function connectDatabase(){

@@ -16,6 +16,7 @@ function showModule(module){
  $("#add").hidden=module!=="finance";
  $(".header .brand span").textContent=module==="finance"?"FINANCE":module==="scout"?"SCOUT":"GALLERY";
  document.title=module==="finance"?"Sheen Finance":module==="scout"?"SHEEN SCOUT":"Sheen Gallery";
+ if(module==="scout"&&window.loadScout)window.loadScout().catch(e=>toast(e.message));
  $("#financeModule").className=module==="finance"?"primary":"ghost";
  $("#showroomModule").className=module==="showroom"?"primary":"ghost";
  $("#scoutModule").className=module==="scout"?"primary":"ghost";

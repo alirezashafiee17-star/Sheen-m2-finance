@@ -72,6 +72,26 @@ async function init(){
  await q("ALTER TABLE users ADD COLUMN IF NOT EXISTS showroom_access BOOLEAN NOT NULL DEFAULT FALSE");
  await q("ALTER TABLE users ADD COLUMN IF NOT EXISTS showroom_edit BOOLEAN NOT NULL DEFAULT FALSE");
  await q("ALTER TABLE users ADD COLUMN IF NOT EXISTS scout_access BOOLEAN NOT NULL DEFAULT FALSE");
+ await q(`CREATE TABLE IF NOT EXISTS scout_watches(
+  id TEXT PRIMARY KEY, name TEXT NOT NULL, model TEXT NOT NULL, year INTEGER,
+  max_price BIGINT, max_mileage BIGINT, city TEXT, required_features TEXT,
+  active BOOLEAN NOT NULL DEFAULT TRUE, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+ ); CREATE TABLE IF NOT EXISTS scout_listings(
+  id TEXT PRIMARY KEY, watch_id TEXT NOT NULL REFERENCES scout_watches(id),
+  source TEXT NOT NULL, title TEXT NOT NULL, url TEXT NOT NULL UNIQUE,
+  price BIGINT, year INTEGER, mileage BIGINT, city TEXT,
+  found_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), status TEXT NOT NULL DEFAULT 'new',
+  note TEXT, feature_evidence TEXT, match_confidence TEXT NOT NULL DEFAULT 'confirmed'
+ ); CREATE TABLE IF NOT EXISTS scout_scans(
+  id TEXT PRIMARY KEY, watch_id TEXT NOT NULL REFERENCES scout_watches(id),
+  status TEXT NOT NULL, checked_count INTEGER NOT NULL DEFAULT 0,
+  saved_count INTEGER NOT NULL DEFAULT 0, detail TEXT NOT NULL,
+  finished_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+ );`);
+ await q("INSERT INTO scout_watches(id,name,model,year,max_price,city,created_at) VALUES('initial-s500','Mercedes-Benz S500','Mercedes-Benz S500',2009,15000000000,'کل ایران','2026-10-22T20:22:14.524Z') ON CONFLICT DO NOTHING");
+ const scoutInitial=require('./scout-initial-data.json');
+ for(const item of scoutInitial.listings)await q(`INSERT INTO scout_listings(id,watch_id,source,title,url,price,year,mileage,city,found_at,status,note,feature_evidence,match_confidence) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) ON CONFLICT DO NOTHING`,[item.id,item.watch_id,item.source,item.title,item.url,item.price,item.year,item.mileage,item.city,item.found_at,item.status,item.note,item.feature_evidence,item.match_confidence]);
+ for(const item of scoutInitial.scans)await q(`INSERT INTO scout_scans(id,watch_id,status,checked_count,saved_count,detail,finished_at) VALUES($1,$2,$3,$4,$5,$6,$7) ON CONFLICT DO NOTHING`,[item.id,item.watch_id,item.status,item.checked_count,item.saved_count,item.detail,item.finished_at]);
  await q(`CREATE TABLE IF NOT EXISTS showroom_cars(
   id UUID PRIMARY KEY, title TEXT NOT NULL, year TEXT NOT NULL DEFAULT '',
   mileage BIGINT NOT NULL DEFAULT 0 CHECK(mileage>=0), paint TEXT NOT NULL DEFAULT '',
@@ -152,6 +172,55 @@ const finance=(req,res,next)=>req.user.role==="owner"||req.user.finance_access?n
 const financeWrite=(req,res,next)=>req.user.role==="owner"||(req.user.finance_access&&req.user.finance_edit)?next():res.status(403).json({error:"اجازهٔ ثبت و ویرایش مالی ندارید"});
 const showroom=(req,res,next)=>req.user.role==="owner"||req.user.showroom_access?next():res.status(403).json({error:"به بخش نمایشگاه دسترسی ندارید"});
 const showroomWrite=(req,res,next)=>req.user.role==="owner"||(req.user.showroom_access&&req.user.showroom_edit)?next():res.status(403).json({error:"مجوز ثبت و ویرایش نمایشگاه ندارید"});
+const scout=(req,res,next)=>req.user.role==="owner"||req.user.scout_access?next():res.status(403).json({error:"به شین اسکات دسترسی ندارید"});
+const scoutWrite=(req,res,next)=>req.user.role==="owner"?next():res.status(403).json({error:"مدیریت جست‌وجوهای اسکات فقط با مالک است"});
+async function scoutData(){
+ const [w,l,s]=await Promise.all([
+  q("SELECT id,name,model,year,max_price AS \"maxPrice\",max_mileage AS \"maxMileage\",city,required_features AS \"requiredFeatures\",active,created_at AS \"createdAt\" FROM scout_watches ORDER BY created_at"),
+  q("SELECT id,watch_id AS \"watchId\",source,title,url,price,year,mileage,city,found_at AS \"foundAt\",status,note,feature_evidence AS \"featureEvidence\",match_confidence AS \"matchConfidence\" FROM scout_listings ORDER BY found_at DESC"),
+  q("SELECT id,watch_id AS \"watchId\",status,checked_count AS \"checkedCount\",saved_count AS \"savedCount\",detail,finished_at AS \"finishedAt\" FROM scout_scans ORDER BY finished_at DESC LIMIT 60")]);
+ return {watches:w.rows,listings:l.rows,scans:s.rows};
+}
+app.get('/api/scout',auth,scout,async(req,res)=>res.json(await scoutData()));
+app.post('/api/scout/watches',auth,scoutWrite,async(req,res)=>{
+ const name=String(req.body.name||'').trim().slice(0,120),model=String(req.body.model||'').trim().slice(0,120);
+ const year=req.body.year?Number(req.body.year):null,maxPrice=req.body.maxPrice?Number(req.body.maxPrice):null,maxMileage=req.body.maxMileage?Number(req.body.maxMileage):null;
+ if(!name||!model||year!==null&&(!Number.isInteger(year)||year<1900||year>2100)||[maxPrice,maxMileage].some(v=>v!==null&&(!Number.isSafeInteger(v)||v<=0)))return res.status(400).json({error:'اطلاعات جست‌وجو معتبر نیست'});
+ const id=crypto.randomUUID();await q('INSERT INTO scout_watches(id,name,model,year,max_price,max_mileage,city,required_features) VALUES($1,$2,$3,$4,$5,$6,$7,$8)',[id,name,model,year,maxPrice,maxMileage,String(req.body.city||'کل ایران').trim().slice(0,100),String(req.body.requiredFeatures||'').trim().slice(0,500)]);
+ await audit(req.user,'scout_watch_create',id);res.status(201).json({id});
+});
+app.delete('/api/scout/watches/:id',auth,scoutWrite,async(req,res)=>{
+ const r=await q('UPDATE scout_watches SET active=false WHERE id=$1 RETURNING id',[req.params.id]);if(!r.rowCount)return res.status(404).json({error:'جست‌وجو پیدا نشد'});await audit(req.user,'scout_watch_stop',req.params.id);res.json({ok:true});
+});
+app.patch('/api/scout/listings/:id',auth,scout,async(req,res)=>{
+ if(!['new','saved','dismissed','contacted'].includes(req.body.status))return res.status(400).json({error:'وضعیت معتبر نیست'});
+ const r=await q('UPDATE scout_listings SET status=$1 WHERE id=$2 RETURNING id',[req.body.status,req.params.id]);if(!r.rowCount)return res.status(404).json({error:'آگهی پیدا نشد'});await audit(req.user,'scout_listing_status',req.params.id,{status:req.body.status});res.json({ok:true});
+});
+// The hourly worker obtains the private Site token at run time; it is also
+// configured on this server, so no long-lived token appears in browser code.
+function scoutAgent(req,res,next){
+ const expected=process.env.SCOUT_AGENT_TOKEN||'',actual=(req.headers.authorization||'').replace(/^Bearer\s+/i,'');
+ const a=Buffer.from(actual),b=Buffer.from(expected);
+ if(!expected||a.length!==b.length||!crypto.timingSafeEqual(a,b))return res.status(401).json({error:'دسترسی عامل مجاز نیست'});
+ next();
+}
+app.get('/api/scout/agent',scoutAgent,async(req,res)=>res.json(await scoutData()));
+app.post('/api/scout/agent/listings',scoutAgent,async(req,res)=>{
+ const x=req.body,watchId=String(x.watchId||''),url=String(x.url||'').trim();
+ if(!/^https:\/\/(?:[\w-]+\.)?(?:bama\.ir|divar\.ir)\//i.test(url)||!String(x.title||'').trim()||!String(x.source||'').trim())return res.status(400).json({error:'آگهی معتبر نیست'});
+ const watch=await q('SELECT id FROM scout_watches WHERE id=$1 AND active=true',[watchId]);if(!watch.rowCount)return res.status(404).json({error:'جست‌وجوی فعال پیدا نشد'});
+ const price=x.price==null?null:Number(x.price),year=x.year==null?null:Number(x.year),mileage=x.mileage==null?null:Number(x.mileage);
+ if([price,year,mileage].some(v=>v!==null&&(!Number.isSafeInteger(v)||v<0)))return res.status(400).json({error:'عدد معتبر نیست'});
+ const id=crypto.randomUUID();const r=await q(`INSERT INTO scout_listings(id,watch_id,source,title,url,price,year,mileage,city,note,feature_evidence,match_confidence) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) ON CONFLICT(url) DO NOTHING RETURNING id`,[id,watchId,String(x.source).slice(0,40),String(x.title).slice(0,240),url,price,year,mileage,String(x.city||'').slice(0,120),String(x.note||'').slice(0,1000),String(x.featureEvidence||'').slice(0,500),String(x.matchConfidence||'confirmed').slice(0,30)]);
+ res.status(r.rowCount?201:200).json({id:r.rows[0]?.id||null,created:!!r.rowCount});
+});
+app.post('/api/scout/agent/scans',scoutAgent,async(req,res)=>{
+ const x=req.body,watchId=String(x.watchId||''),status=String(x.status||'partial'),detail=String(x.detail||'').trim();
+ if(!['complete','partial','failed'].includes(status)||!detail||detail.length>3000)return res.status(400).json({error:'گزارش معتبر نیست'});
+ const watch=await q('SELECT id FROM scout_watches WHERE id=$1',[watchId]);if(!watch.rowCount)return res.status(404).json({error:'جست‌وجو پیدا نشد'});
+ const checkedCount=Number(x.checkedCount||0),savedCount=Number(x.savedCount||0);if(!Number.isInteger(checkedCount)||!Number.isInteger(savedCount)||checkedCount<0||savedCount<0)return res.status(400).json({error:'تعداد معتبر نیست'});
+ const id=crypto.randomUUID();await q('INSERT INTO scout_scans(id,watch_id,status,checked_count,saved_count,detail) VALUES($1,$2,$3,$4,$5,$6)',[id,watchId,status,checkedCount,savedCount,detail]);res.status(201).json({id});
+});
 async function audit(user,action,target,data={}){await q("INSERT INTO audit_log(id,action,target,data,actor_id) VALUES($1,$2,$3,$4,$5)",[crypto.randomUUID(),action,target,JSON.stringify(data),user.sub]).catch(()=>{})}
 function periodOf(value){
  const d=new Date(value); if(Number.isNaN(d.getTime())) return null;
@@ -516,7 +585,7 @@ app.put("/api/showroom/deals/:id",showroomWrite,async(req,res)=>{
  await audit(req.user,"showroom_deal_update",req.params.id,{before:old.rows[0],after:{carId,sale,acquisition,expense,commission,notes}});res.json({ok:true});
 });
 // Serve only browser assets. Never expose server source, archives or local files.
-for(const asset of ["index.html","agency.html","app.js","showroom.js"]){
+for(const asset of ["index.html","agency.html","app.js","showroom.js","scout.js"]){
  app.get("/"+asset,(req,res)=>res.sendFile(path.join(__dirname,asset)));
 }
 app.get("*",(req,res)=>res.sendFile(path.join(__dirname,"index.html")));

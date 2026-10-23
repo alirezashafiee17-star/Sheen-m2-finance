@@ -89,9 +89,6 @@ async function init(){
   finished_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
  );`);
  await q("INSERT INTO scout_watches(id,name,model,year,max_price,city,created_at) VALUES('initial-s500','Mercedes-Benz S500','Mercedes-Benz S500',2009,15000000000,'کل ایران','2026-10-22T20:22:14.524Z') ON CONFLICT DO NOTHING");
- const scoutInitial=require('./scout-initial-data.json');
- for(const item of scoutInitial.listings)await q(`INSERT INTO scout_listings(id,watch_id,source,title,url,price,year,mileage,city,found_at,status,note,feature_evidence,match_confidence) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) ON CONFLICT DO NOTHING`,[item.id,item.watch_id,item.source,item.title,item.url,item.price,item.year,item.mileage,item.city,item.found_at,item.status,item.note,item.feature_evidence,item.match_confidence]);
- for(const item of scoutInitial.scans)await q(`INSERT INTO scout_scans(id,watch_id,status,checked_count,saved_count,detail,finished_at) VALUES($1,$2,$3,$4,$5,$6,$7) ON CONFLICT DO NOTHING`,[item.id,item.watch_id,item.status,item.checked_count,item.saved_count,item.detail,item.finished_at]);
  await q(`CREATE TABLE IF NOT EXISTS showroom_cars(
   id UUID PRIMARY KEY, title TEXT NOT NULL, year TEXT NOT NULL DEFAULT '',
   mileage BIGINT NOT NULL DEFAULT 0 CHECK(mileage>=0), paint TEXT NOT NULL DEFAULT '',
@@ -182,6 +179,19 @@ async function scoutData(){
  return {watches:w.rows,listings:l.rows,scans:s.rows};
 }
 app.get('/api/scout',auth,scout,async(req,res)=>res.json(await scoutData()));
+app.post('/api/scout/import',auth,scoutWrite,async(req,res)=>{
+ const items=req.body;
+ if(!Array.isArray(items.listings)||!Array.isArray(items.scans)||items.listings.length>100||items.scans.length>500)return res.status(400).json({error:'داده‌های انتقال معتبر نیست'});
+ for(const x of items.listings){
+  if(!x.id||!x.watch_id||!/^https:\/\/(?:[\w-]+\.)?(?:bama\.ir|divar\.ir)\//i.test(x.url||''))continue;
+  await q(`INSERT INTO scout_listings(id,watch_id,source,title,url,price,year,mileage,city,found_at,status,note,feature_evidence,match_confidence) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) ON CONFLICT DO NOTHING`,[x.id,x.watch_id,x.source,x.title,x.url,x.price,x.year,x.mileage,x.city,x.found_at,x.status,x.note,x.feature_evidence,x.match_confidence]);
+ }
+ for(const x of items.scans){
+  if(!x.id||!x.watch_id||!x.detail)continue;
+  await q(`INSERT INTO scout_scans(id,watch_id,status,checked_count,saved_count,detail,finished_at) VALUES($1,$2,$3,$4,$5,$6,$7) ON CONFLICT DO NOTHING`,[x.id,x.watch_id,x.status,x.checked_count,x.saved_count,x.detail,x.finished_at]);
+ }
+ await audit(req.user,'scout_private_import','initial',{listings:items.listings.length,scans:items.scans.length});res.json({ok:true});
+});
 app.post('/api/scout/watches',auth,scoutWrite,async(req,res)=>{
  const name=String(req.body.name||'').trim().slice(0,120),model=String(req.body.model||'').trim().slice(0,120);
  const year=req.body.year?Number(req.body.year):null,maxPrice=req.body.maxPrice?Number(req.body.maxPrice):null,maxMileage=req.body.maxMileage?Number(req.body.maxMileage):null;

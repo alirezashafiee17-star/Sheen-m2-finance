@@ -22,7 +22,7 @@ function canEdit(){return !!currentUser?.financeAccess&&!!currentUser?.financeEd
 function canEditRow(r){return canEdit()}
 function stats(list=rows){let income=0,expense=0,withdrawal=0;for(const r of list){if(r.deletedAt)continue;if(r.kind==="income")income+=r.amount;if(r.kind==="expense")expense+=r.amount;if(r.kind==="withdrawal")withdrawal+=r.amount}const profit=income-expense;return{income,expense,withdrawal,profit,cash:profit-withdrawal}}
 function dayKey(v){return new Intl.DateTimeFormat('en-CA',{timeZone:'Asia/Tehran',year:'numeric',month:'2-digit',day:'2-digit'}).format(new Date(v))}
-function duplicateText(v){return normalizeDigits(v??'').trim().replace(/\\s+/g,' ').toLowerCase()}
+function duplicateText(v){return normalizeDigits(v??'').trim().replace(/\s+/g,' ').toLowerCase()}
 function discrepancyGroups(list=filteredRows()){
  const active=list.filter(r=>!r.deletedAt), byAmount=new Map(),byText=new Map();
  for(const r of active){

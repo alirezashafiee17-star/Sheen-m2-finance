@@ -67,6 +67,9 @@ async function init(){
   counter BIGINT NOT NULL DEFAULT 0, transports TEXT[] NOT NULL DEFAULT '{}', created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
  );`);
  await q("ALTER TABLE users ADD COLUMN IF NOT EXISTS finance_access BOOLEAN NOT NULL DEFAULT TRUE");
+ await q("ALTER TABLE transactions ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ");
+ await q("ALTER TABLE transactions ADD COLUMN IF NOT EXISTS deleted_by_name TEXT");
+ await q("ALTER TABLE transaction_edits ADD COLUMN IF NOT EXISTS action TEXT NOT NULL DEFAULT 'edit'");
  await q("ALTER TABLE users ADD COLUMN IF NOT EXISTS finance_edit BOOLEAN NOT NULL DEFAULT FALSE");
  await q("ALTER TABLE users ADD COLUMN IF NOT EXISTS display_title TEXT NOT NULL DEFAULT 'عضو'");
  await q("ALTER TABLE users ADD COLUMN IF NOT EXISTS showroom_access BOOLEAN NOT NULL DEFAULT FALSE");
@@ -279,7 +282,7 @@ app.get("/api/me",auth,async(req,res)=>{const r=await q("SELECT * FROM users WHE
 app.use(["/api/transactions","/api/transaction-edits","/api/periods","/api/import"],auth,finance);
 app.get("/api/transactions",auth,async(req,res)=>{
  await closePastPeriods();
- const r=await q("SELECT id,kind,amount::text,description AS desc,happened_at AS date,period,actor_name AS \"actorName\",actor_email AS \"actorEmail\" FROM transactions ORDER BY happened_at DESC");
+ const r=await q("SELECT id,kind,amount::text,description AS desc,happened_at AS date,period,actor_name AS \"actorName\",actor_email AS \"actorEmail\",deleted_at AS \"deletedAt\",deleted_by_name AS \"deletedByName\" FROM transactions ORDER BY happened_at DESC");
  res.json(r.rows.map(x=>({...x,amount:Number(x.amount)})));
 });
 app.get("/api/transaction-edits",auth,async(req,res)=>{
@@ -287,7 +290,7 @@ app.get("/api/transaction-edits",auth,async(req,res)=>{
  before_amount::text AS "beforeAmount",after_amount::text AS "afterAmount",
  before_kind AS "beforeKind",after_kind AS "afterKind",
  before_description AS "beforeDescription",after_description AS "afterDescription",
- before_happened_at AS "beforeDate",after_happened_at AS "afterDate",edited_at AS "editedAt"
+ before_happened_at AS "beforeDate",after_happened_at AS "afterDate",edited_at AS "editedAt",action
  FROM transaction_edits ORDER BY edited_at ASC,id ASC`);
  res.json(r.rows.map(x=>({...x,beforeAmount:Number(x.beforeAmount),afterAmount:Number(x.afterAmount)})));
 });
@@ -306,7 +309,7 @@ app.put("/api/transactions/:id",auth,financeWrite,async(req,res)=>{
  try{
   await client.query("BEGIN");
   const old=await client.query("SELECT * FROM transactions WHERE id=$1 FOR UPDATE",[req.params.id]);
-  if(!old.rowCount){await client.query("ROLLBACK");return res.status(404).json({error:"تراکنش پیدا نشد"})}
+  if(!old.rowCount||old.rows[0].deleted_at){await client.query("ROLLBACK");return res.status(404).json({error:"تراکنش پیدا نشد"})}
   const before=old.rows[0];
   if(req.user.role!=="owner"){
    const pr=await client.query("SELECT closed FROM periods WHERE period=$1",[before.period]);
@@ -322,6 +325,25 @@ app.put("/api/transactions/:id",auth,financeWrite,async(req,res)=>{
   res.json({ok:true});
  }catch(e){await client.query("ROLLBACK").catch(()=>{});console.error("Transaction update failed",e.code||e.message);res.status(500).json({error:"ویرایش ذخیره نشد؛ دوباره تلاش کنید"})}
  finally{client.release()}
+});
+app.delete("/api/transactions/:id",auth,financeWrite,async(req,res)=>{
+ const client=await pool.connect();
+ try{
+  await client.query("BEGIN");
+  const old=await client.query("SELECT * FROM transactions WHERE id=$1 FOR UPDATE",[req.params.id]);
+  if(!old.rowCount||old.rows[0].deleted_at){await client.query("ROLLBACK");return res.status(404).json({error:"تراکنش پیدا نشد"})}
+  const before=old.rows[0];
+  if(req.user.role!=="owner"){
+   const pr=await client.query("SELECT closed FROM periods WHERE period=$1",[before.period]);
+   if(before.period!==currentPeriod()||pr.rows[0]?.closed){await client.query("ROLLBACK");return res.status(403).json({error:"ماه بسته شده است"})}
+  }
+  const user=await client.query("SELECT name FROM users WHERE id=$1 AND active=true",[req.user.sub]);
+  if(!user.rowCount){await client.query("ROLLBACK");return res.status(401).json({error:"حساب غیرفعال است"})}
+  await client.query("UPDATE transactions SET deleted_at=NOW(),deleted_by_name=$1,updated_at=NOW() WHERE id=$2",[user.rows[0].name,req.params.id]);
+  await client.query(`INSERT INTO transaction_edits(id,transaction_id,actor_id,actor_name,before_amount,after_amount,before_kind,after_kind,before_description,after_description,before_happened_at,after_happened_at,action)
+   VALUES($1,$2,$3,$4,$5,0,$6,$6,$7,$7,$8,$8,'delete')`,[crypto.randomUUID(),req.params.id,req.user.sub,user.rows[0].name,before.amount,before.kind,before.description,before.happened_at]);
+  await client.query("COMMIT");res.json({ok:true});
+ }catch(e){await client.query("ROLLBACK").catch(()=>{});console.error("Transaction delete failed",e.code||e.message);res.status(500).json({error:"حذف ذخیره نشد"})}finally{client.release()}
 });
 app.get("/api/periods",auth,async(req,res)=>{await closePastPeriods();const r=await q("SELECT period,closed FROM periods");res.json(Object.fromEntries(r.rows.map(x=>[x.period,x])))});
 app.get("/api/members",auth,allow("owner"),async(req,res)=>{const r=await q("SELECT id,name,email,role,display_title AS \"displayTitle\",active,finance_access AS \"financeAccess\",finance_edit AS \"financeEdit\",showroom_access AS \"showroomAccess\",showroom_edit AS \"showroomEdit\",scout_access AS \"scoutAccess\" FROM users WHERE role<>'owner' AND active=true ORDER BY created_at");res.json(r.rows)});

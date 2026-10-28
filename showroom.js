@@ -4,18 +4,19 @@ const leadStatus={followup:"پیگیری",visit:"هماهنگی بازدید",ne
 const ownerType={owned:"خرید نمایشگاه",consignment:"امانی"};
 function showModule(module){
  if(!currentUser)return;
- if(module==="finance"&&!currentUser.financeAccess||module==="showroom"&&!currentUser.showroomAccess||module==="scout"&&!currentUser.scoutAccess)return;
- $("#modulePicker").hidden=[currentUser.financeAccess,currentUser.showroomAccess,currentUser.scoutAccess].filter(Boolean).length<2;
- $("#financeModule").hidden=!currentUser.financeAccess;
+ if(module==="entry"&&!currentUser.financeEntryOnly||module==="finance"&&(!currentUser.financeAccess||currentUser.financeEntryOnly)||module==="showroom"&&!currentUser.showroomAccess||module==="scout"&&!currentUser.scoutAccess)return;
+ $("#modulePicker").hidden=module==="entry"||[currentUser.financeAccess,currentUser.showroomAccess,currentUser.scoutAccess].filter(Boolean).length<2;
+ $("#financeModule").hidden=!currentUser.financeAccess||currentUser.financeEntryOnly;
  $("#showroomModule").hidden=!currentUser.showroomAccess;
  $("#scoutModule").hidden=!currentUser.scoutAccess;
  $("#financeArea").hidden=module!=="finance";
+ $("#entryArea").hidden=module!=="entry";
  $("#showroomArea").hidden=module!=="showroom";
  $("#scoutArea").hidden=module!=="scout";
  $("#financeNav").hidden=module!=="finance";
  $("#add").hidden=module!=="finance";
- $(".header .brand span").textContent=module==="finance"?"FINANCE":module==="scout"?"SCOUT":"GALLERY";
- document.title=module==="finance"?"Sheen Finance":module==="scout"?"SHEEN SCOUT":"Sheen Gallery";
+ $(".header .brand span").textContent=module==="finance"||module==="entry"?"FINANCE":module==="scout"?"SCOUT":"GALLERY";
+ document.title=module==="entry"?"ثبت تراکنش شین":module==="finance"?"Sheen Finance":module==="scout"?"SHEEN SCOUT":"Sheen Gallery";
  if(module==="scout"&&window.loadScout)window.loadScout().catch(e=>toast(e.message));
  $("#financeModule").className=module==="finance"?"primary":"ghost";
  $("#showroomModule").className=module==="showroom"?"primary":"ghost";

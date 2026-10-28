@@ -285,6 +285,11 @@ app.post("/api/auth/passkey/login",async(req,res)=>{
 });
 app.get("/api/me",auth,async(req,res)=>{const r=await q("SELECT * FROM users WHERE id=$1 AND active=true",[req.user.sub]);if(!r.rowCount)return res.status(401).json({error:"حساب غیرفعال است"});res.json(publicUser(r.rows[0]))});
 app.use(["/api/transaction-edits","/api/periods","/api/import"],auth,finance);
+app.get("/api/transactions/recent",auth,financeCreate,async(req,res)=>{
+ const r=await q(`SELECT id,kind,amount::text,description AS desc,withdrawal_by AS "withdrawalBy",happened_at AS date,period,actor_name AS "actorName"
+ FROM transactions WHERE actor_id=$1 AND deleted_at IS NULL ORDER BY created_at DESC,id DESC LIMIT 10`,[req.user.sub]);
+ res.json(r.rows.map(x=>({...x,amount:Number(x.amount)})));
+});
 app.get("/api/transactions",auth,finance,async(req,res)=>{
  await closePastPeriods();
  const r=await q("SELECT id,kind,amount::text,description AS desc,withdrawal_by AS \"withdrawalBy\",happened_at AS date,period,actor_name AS \"actorName\",actor_email AS \"actorEmail\",deleted_at AS \"deletedAt\",deleted_by_name AS \"deletedByName\" FROM transactions ORDER BY happened_at DESC");
@@ -355,7 +360,7 @@ app.delete("/api/transactions/:id",auth,financeWrite,async(req,res)=>{
  }catch(e){await client.query("ROLLBACK").catch(()=>{});console.error("Transaction delete failed",e.code||e.message);res.status(500).json({error:"حذف ذخیره نشد"})}finally{client.release()}
 });
 app.get("/api/periods",auth,async(req,res)=>{await closePastPeriods();const r=await q("SELECT period,closed FROM periods");res.json(Object.fromEntries(r.rows.map(x=>[x.period,x])))});
-app.get("/api/members",auth,allow("owner"),async(req,res)=>{const r=await q("SELECT id,name,email,role,display_title AS \"displayTitle\",active,finance_access AS \"financeAccess\",finance_edit AS \"financeEdit\",showroom_access AS \"showroomAccess\",showroom_edit AS \"showroomEdit\",scout_access AS \"scoutAccess\" FROM users WHERE role<>'owner' AND active=true ORDER BY created_at");res.json(r.rows)});
+app.get("/api/members",auth,allow("owner"),async(req,res)=>{const r=await q("SELECT id,name,email,role,display_title AS \"displayTitle\",active,finance_entry_only AS \"financeEntryOnly\",finance_access AS \"financeAccess\",finance_edit AS \"financeEdit\",showroom_access AS \"showroomAccess\",showroom_edit AS \"showroomEdit\",scout_access AS \"scoutAccess\" FROM users WHERE role<>'owner' AND active=true ORDER BY created_at");res.json(r.rows)});
 app.post("/api/members",auth,allow("owner"),async(req,res)=>{
  const name=String(req.body.name||"").trim(),email=cleanEmail(req.body.email),role=req.body.role,password=String(req.body.password||"");
  const financeEntryOnly=req.body.financeEntryOnly===true,financeAccess=req.body.financeAccess===true||financeEntryOnly,financeEdit=!financeEntryOnly&&financeAccess&&req.body.financeEdit===true,showroomAccess=req.body.showroomAccess===true,showroomEdit=showroomAccess&&req.body.showroomEdit===true,scoutAccess=req.body.scoutAccess===true,displayTitle=req.body.displayTitle;
@@ -636,3 +641,4 @@ async function connectDatabase(){
  catch(e){dbReady=false;dbErrorCode=e.code||"DB_UNAVAILABLE";console.error("Database unavailable",dbErrorCode);setTimeout(connectDatabase,10000)}
 }
 connectDatabase();
+

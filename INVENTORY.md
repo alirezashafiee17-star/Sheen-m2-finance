@@ -4,13 +4,13 @@ Inventory is a module within the existing application, using its PostgreSQL data
 
 ## Access
 
-Only the owner grants inventory access, edit rights, price visibility, and a scope (`services`, `gallery`, or `both`) in member management. All defaults are disabled. Inventory-only accounts do not need finance or showroom access. Entry-only finance accounts cannot also receive inventory access. Price fields and financial links are stripped by the server for accounts without price permission.
+Only the owner grants inventory access, edit rights, price visibility, and a scope (`services`, `gallery`, or `both`) in member management. A separate inventory-manage option grants edit, price and stock count powers within the assigned scope; transfers require access to both source and destination. It does not grant member administration or full financial access. All defaults are disabled. Inventory-only accounts do not need finance or showroom access. The financial ten-row restriction can be combined independently with inventory, showroom and scout access. Its edit option permits updates only to the user's own latest ten active financial entries; it does not permit deleting entries or reading financial dashboards. Price fields and financial links are stripped by the server for accounts without price permission.
 
 ## Stock and cost
 
 Each item has a scope-specific SKU, optional barcode, base unit, purchase unit, conversion factor, minimum stock, and location. Units/conversion are fixed after creation to preserve historical quantities. Purchases carry the total cost after discount. Quantities support three decimal places; consumption uses a moving weighted average at registration time, with costs recorded in whole tomans.
 
-Movements are immutable. Consumption returns restore original cost. Owner-only physical counts correct discrepancies with a reason. Inter-warehouse transfers move both stock and its carrying value atomically. Tools on loan remain owned stock and retain value, while their quantities are excluded from available stock. All changes record the actor and time; requests have idempotency keys and row locks protect available stock.
+Normal movements have a dedicated edit action with immutable before/after edit history. Quantity/cost edits are allowed only on the latest stock-affecting movement for the item, preserving downstream costs; otherwise use physical count or a consumption return. Consumption returns restore original cost. Owner/delegated-manager physical counts correct discrepancies with a reason. Inter-warehouse transfers move both stock and its carrying value atomically. Tools on loan remain owned stock and retain value, while their quantities are excluded from available stock. All changes record the actor and time; requests have idempotency keys and row locks protect available stock.
 
 Vehicle dossiers record material cost separately from financial payments. Gallery dossiers can link to an existing showroom vehicle; the showroom's car card opens its inventory dossier. Service dossiers can carry a plate and reception/order number.
 

@@ -20,9 +20,32 @@ test('full app: migration, login, inventory-only member, UI forms, and linked fi
   $('ivAdd').click();assert.equal($('inventoryModal').open,true);const form=$('ivForm');assert.equal(form.elements.unitCost,undefined);assert.equal(form.elements.opening,undefined);form.elements.name.value='Test item';form.elements.sku.value='TEST';form.elements.minStock.value='2';await form.onsubmit({target:form,preventDefault(){}});assert.equal($('ivFormError').textContent,'');assert.ok($('ivBody').textContent.includes('Test item'));assert.ok(!$('ivStats').textContent.includes('ارزش'));
   // Open the owner account and verify member permissions survive edit.
   $('logout').onclick();$('loginEmail').value='owner@example.invalid';$('loginPassword').value='Test-only-secret-123';await $('loginBtn').onclick();w.eval('openMember(members[0])');assert.equal($('memberInventory').checked,true);assert.equal($('memberInventoryPrices').checked,false);assert.equal($('memberInventoryScope').value,'services');$('memberModal').close();$('inventoryModule').click();await w.loadInventory();assert.equal($('inventoryArea').hidden,false);$('ivIn').click();assert.equal(form.elements.payment.value,'none');form.elements.quantity.value='4';form.elements.totalCost.value='100';form.elements.party.value='Supplier';form.elements.payment.value='create';form.elements.paidAmount.value='100';await form.onsubmit({target:form,preventDefault(){}});assert.equal($('ivFormError').textContent,'');
+  w.document.querySelector('[data-ivtab="moves"]').click();const editMove=$('ivBody').querySelector('[data-iv-move-edit]');assert.ok(editMove);editMove.click();assert.equal($('inventoryModal').open,true);assert.equal(form.elements.quantity.value,'4');form.elements.party.value='Supplier corrected';await form.onsubmit({target:form,preventDefault(){}});assert.equal($('ivFormError').textContent,'');assert.ok($('ivBody').textContent.includes('Supplier corrected'));
   const trs=await call('/transactions',null,token);assert.equal(trs.data.length,1);const tx=trs.data[0];assert.equal((await call('/transactions/'+tx.id,null,token,'DELETE')).status,409);assert.equal((await call('/transactions/'+tx.id,{amount:100,kind:'expense',desc:'changed',date:new Date().toISOString()},token,'PUT')).status,409);
-  // Entry-only access remains incompatible with inventory.
-  assert.equal((await call('/members/'+created.data.id,{...member,financeEntryOnly:true},token,'PUT')).status,400);
+  // Financial ten-row restriction is independent of other module permissions.
+  const combined={...member,financeEntryOnly:true,financeEdit:true,showroomAccess:true,inventoryManage:true,inventoryScope:'both'};
+  assert.equal((await call('/members/'+created.data.id,combined,token,'PUT')).status,200);
+  await w.eval('loadAll()');w.eval('openMember(members[0])');assert.equal($('memberEntryOnly').checked,true);assert.equal($('memberInventoryManage').checked,true);assert.equal($('memberFinanceEdit').disabled,false);
+  $('memberScout').checked=true;$('memberScout').onchange();assert.equal($('memberEntryOnly').checked,true);
+  $('memberInventory').checked=true;$('memberInventory').onchange();assert.equal($('memberEntryOnly').checked,true);
+  await w.eval('saveMember()');const saved=(await call('/members',null,token)).data[0];assert.equal(saved.financeEntryOnly,true);assert.equal(saved.financeEdit,true);assert.equal(saved.inventoryManage,true);assert.equal(saved.scoutAccess,true);
+  $('logout').onclick();$('loginEmail').value=member.email;$('loginPassword').value=member.password;await $('loginBtn').onclick();assert.equal($('entryArea').hidden,false);assert.equal($('modulePicker').hidden,false);assert.equal($('financeArea').hidden,true);
+  $('inventoryModule').click();await w.loadInventory();assert.equal($('inventoryArea').hidden,false);$('financeModule').click();assert.equal($('entryArea').hidden,false);
+  const limited=(await call('/auth/login',{email:member.email,password:member.password})).data.token,own=[];
+  for(let n=0;n<11;n++){const r=await call('/transactions',{kind:'income',amount:n+10,desc:'Own '+n,date:new Date().toISOString()},limited);assert.equal(r.status,201,JSON.stringify(r));own.push(r.data.id)}
+  const rec=await call('/transactions/recent',null,limited);assert.equal(rec.data.length,10);assert.ok(!rec.data.some(r=>r.id===own[0]));
+  const edit={kind:'income',amount:44,desc:'Edited limited',date:new Date().toISOString()};
+  assert.equal((await call('/transactions/'+own[0],edit,limited,'PUT')).status,403);
+  assert.equal((await call('/transactions/'+tx.id,edit,limited,'PUT')).status,403);
+  assert.equal((await call('/transactions/'+own[10],edit,limited,'PUT')).status,200);
+  assert.equal((await call('/transactions/'+own[10],{...edit,date:new Date(Date.now()-60*86400000).toISOString()},limited,'PUT')).status,403);
+  assert.equal((await call('/transactions',null,limited)).status,403);assert.equal((await call('/transaction-edits',null,limited)).status,403);
+  assert.equal((await call('/transactions/'+own[10],null,limited,'DELETE')).status,403);
+  await w.eval('loadAll()');assert.ok($('entryRecent').querySelector('[data-edit]'));assert.equal($('entryRecent').querySelector('[data-delete]'),null);
+  $('entryRecent').querySelector('[data-edit]').click();assert.equal($('modal').open,true);$('desc').value='UI recent edit';await w.eval('saveTransaction()');assert.ok($('entryRecent').textContent.includes('UI recent edit'));
+  const logs=await query('SELECT * FROM transaction_edits WHERE transaction_id=$1',[own[10]]);assert.ok(logs.rowCount>=1);
+  assert.equal((await call('/members/'+created.data.id,{...combined,financeEdit:false},token,'PUT')).status,200);
+  assert.equal((await call('/transactions/'+own[10],edit,limited,'PUT')).status,403);
   assert.deepEqual(errors,[]);
  }finally{dom?.window.close();if(server)await new Promise(r=>server.close(r));await db.close()}
 });

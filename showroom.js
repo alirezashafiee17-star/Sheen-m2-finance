@@ -5,12 +5,13 @@ const ownerType={owned:"خرید نمایشگاه",consignment:"امانی"};
 function showModule(module){
  if(!currentUser)return;
  if(module==="entry"&&!currentUser.financeEntryOnly||module==="finance"&&(!currentUser.financeAccess||currentUser.financeEntryOnly)||module==="showroom"&&!currentUser.showroomAccess||module==="scout"&&!currentUser.scoutAccess||module==="inventory"&&!currentUser.inventoryAccess)return;
- $("#modulePicker").hidden=module==="entry"||[currentUser.financeAccess,currentUser.showroomAccess,currentUser.scoutAccess,currentUser.inventoryAccess].filter(Boolean).length<2;
+ $("#modulePicker").hidden=[currentUser.financeAccess,currentUser.showroomAccess,currentUser.scoutAccess,currentUser.inventoryAccess].filter(Boolean).length<2;
  $("#inventoryModule").hidden=!currentUser.inventoryAccess;
  $("#inventoryArea").hidden=module!=="inventory";
  $("#inventoryModule").className=module==="inventory"?"primary":"ghost";
  if(module==="inventory"&&window.loadInventory)window.loadInventory().catch(e=>toast(e.message));
- $("#financeModule").hidden=!currentUser.financeAccess||currentUser.financeEntryOnly;
+ $("#financeModule").hidden=!currentUser.financeAccess;
+ $("#financeModule").textContent=currentUser.financeEntryOnly?"۱۰ تراکنش آخر من":"مالی شین";
  $("#showroomModule").hidden=!currentUser.showroomAccess;
  $("#scoutModule").hidden=!currentUser.scoutAccess;
  $("#financeArea").hidden=module!=="finance";
@@ -22,7 +23,7 @@ function showModule(module){
  $(".header .brand span").textContent=module==="finance"||module==="entry"?"FINANCE":module==="scout"?"SCOUT":module==="inventory"?"INVENTORY":"GALLERY";
  document.title=module==="entry"?"ثبت تراکنش شین":module==="finance"?"Sheen Finance":module==="scout"?"SHEEN SCOUT":module==="inventory"?"انبار شین":"Sheen Gallery";
  if(module==="scout"&&window.loadScout)window.loadScout().catch(e=>toast(e.message));
- $("#financeModule").className=module==="finance"?"primary":"ghost";
+ $("#financeModule").className=module==="finance"||module==="entry"?"primary":"ghost";
  $("#showroomModule").className=module==="showroom"?"primary":"ghost";
  $("#scoutModule").className=module==="scout"?"primary":"ghost";
 }
@@ -82,7 +83,7 @@ $("#showroomForm").onsubmit=async e=>{
 $("#closeShowroom").onclick=()=>$("#showroomModal").close();
 $("#showroomAdd").onclick=()=>openShowroom(showroomTab);
 $$(".showroom-tab").forEach(b=>b.onclick=()=>{showroomTab=b.dataset.showroom;renderShowroom()});
-$("#financeModule").onclick=()=>showModule("finance");
+$("#financeModule").onclick=()=>showModule(currentUser?.financeEntryOnly?"entry":"finance");
 $("#showroomModule").onclick=()=>showModule("showroom");
 $("#scoutModule").onclick=()=>showModule("scout");
 $("#printShowroom").onclick=()=>{document.body.classList.add("print-showroom");window.print()};

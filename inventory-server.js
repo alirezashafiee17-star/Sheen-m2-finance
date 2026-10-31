@@ -8,11 +8,13 @@ const cash=v=>v!==''&&v!=null&&Number.isSafeInteger(Number(v))&&Number(v)>=0&&Nu
 const qty=n=>Math.round(Number(n)*1000)/1000;
 const fail=(status,message)=>Object.assign(new Error(message),{status});
 const owner=u=>u.role==='owner';
-const canAccess=(u,s)=>SCOPES.includes(s)&&(owner(u)||(!u.finance_entry_only&&u.inventory_access&&(u.inventory_scope===s||u.inventory_scope==='both')));
-const canPrice=u=>owner(u)||!!u.inventory_prices;
+const canAccess=(u,s)=>SCOPES.includes(s)&&(owner(u)||(u.inventory_access&&(u.inventory_scope===s||u.inventory_scope==='both')));
+const canManage=u=>owner(u)||!!u.inventory_manage;
+const canPrice=u=>canManage(u)||!!u.inventory_prices;
 function costOf(item,n){const total=Number(item.quantity),value=Number(item.stock_value);return n===total?value:Math.round(value*n/total)}
 async function initInventory(q){
  await q(`ALTER TABLE users ADD COLUMN IF NOT EXISTS inventory_access BOOLEAN NOT NULL DEFAULT FALSE;
+ ALTER TABLE users ADD COLUMN IF NOT EXISTS inventory_manage BOOLEAN NOT NULL DEFAULT FALSE;
  ALTER TABLE users ADD COLUMN IF NOT EXISTS inventory_edit BOOLEAN NOT NULL DEFAULT FALSE;
  ALTER TABLE users ADD COLUMN IF NOT EXISTS inventory_prices BOOLEAN NOT NULL DEFAULT FALSE;
  ALTER TABLE users ADD COLUMN IF NOT EXISTS inventory_scope TEXT NOT NULL DEFAULT 'services';
@@ -47,6 +49,10 @@ async function initInventory(q){
  CREATE UNIQUE INDEX IF NOT EXISTS inventory_finance_link ON inventory_moves(transaction_id) WHERE transaction_id IS NOT NULL;
  CREATE INDEX IF NOT EXISTS inventory_moves_scope ON inventory_moves(scope,created_at DESC);
  CREATE INDEX IF NOT EXISTS inventory_moves_vehicle ON inventory_moves(vehicle_id);
+ CREATE TABLE IF NOT EXISTS inventory_move_edits(
+ id UUID PRIMARY KEY,move_id UUID NOT NULL REFERENCES inventory_moves(id),scope TEXT NOT NULL,
+ actor_id UUID NOT NULL REFERENCES users(id),actor_name TEXT NOT NULL,before_data JSONB NOT NULL,after_data JSONB NOT NULL,
+ edited_at TIMESTAMPTZ NOT NULL DEFAULT NOW());
  CREATE TABLE IF NOT EXISTS inventory_loans(
  id UUID PRIMARY KEY,item_id UUID NOT NULL REFERENCES inventory_items(id),scope TEXT NOT NULL,
  quantity NUMERIC(18,3) NOT NULL CHECK(quantity>0),person TEXT NOT NULL,due_date DATE,
@@ -55,9 +61,9 @@ async function initInventory(q){
 function installInventory(app,{q,pool,auth,periodOf,currentPeriod}){
  const router=require('express').Router();router.use(auth);
  router.use((req,res,next)=>{req.inventoryScope=String(req.query.scope||req.body?.scope||'services');if(!canAccess(req.user,req.inventoryScope))return res.status(403).json({error:'به این انبار دسترسی ندارید'});next()});
- const write=(req,res,next)=>owner(req.user)||req.user.inventory_edit?next():res.status(403).json({error:'اجازه ثبت گردش انبار ندارید'});
+ const write=(req,res,next)=>canManage(req.user)||req.user.inventory_edit?next():res.status(403).json({error:'اجازه ثبت گردش انبار ندارید'});
  const priced=(req,res,next)=>canPrice(req.user)?next():res.status(403).json({error:'مجوز مشاهده و ثبت قیمت خرید لازم است'});
- const onlyOwner=(req,res,next)=>owner(req.user)?next():res.status(403).json({error:'این عملیات فقط با مدیر اصلی است'});
+ const onlyOwner=(req,res,next)=>canManage(req.user)?next():res.status(403).json({error:'مجوز مدیریت کامل انبار لازم است'});
  const wrap=fn=>async(req,res)=>{try{await fn(req,res)}catch(e){if(!e.status)console.error('Inventory request failed',e.code||e.message);const status=e.status||(e.code==='23505'?409:e.code==='22P02'?400:500);res.status(status).json({error:e.status?e.message:e.code==='23505'?'کد کالا، بارکد یا سند مالی قبلاً استفاده شده است':status===400?'شناسه یا مقدار معتبر نیست':'ثبت انجام نشد؛ دوباره تلاش کنید'})}};
  function date(v){const d=new Date(v||Date.now());if(Number.isNaN(d.getTime())||d.getTime()>Date.now()+300000)throw fail(400,'تاریخ معتبر نیست یا در آینده است');return d.toISOString()}
  const day=v=>{if(!v)return null;if(!/^\d{4}-\d{2}-\d{2}$/.test(v)||Number.isNaN(new Date(v).getTime())||new Date(v).toISOString().slice(0,10)!==v)throw fail(400,'تاریخ معتبر نیست');return v};
@@ -114,12 +120,53 @@ function installInventory(app,{q,pool,auth,periodOf,currentPeriod}){
    const id=await move(c,req,i,{type:b.type,quantity:amount,value,party:b.party,reason:b.reason,invoice:b.invoice,serial:b.serial,expiryDate:b.expiryDate,vehicleId:b.type==='consume'?b.vehicleId:null,transactionId,date:happened});return {id,...(canPrice(req.user)?{transactionId}:{})};
   }));
  }));
+ router.put('/movements/:id',write,wrap(async(req,res)=>{
+  const b=req.body;if(!uuid(req.params.id)||!text(b.party,120))throw fail(400,'گردش و طرف حساب معتبر لازم است');
+  res.json(await atomic(req,async c=>{
+   const initial=await c.query('SELECT * FROM inventory_moves WHERE id=$1 AND scope=$2',[req.params.id,req.inventoryScope]);
+   if(!initial.rowCount)throw fail(404,'گردش انبار پیدا نشد');
+   const original=initial.rows[0],i=await item(c,original.item_id,req.inventoryScope);
+   const locked=await c.query('SELECT * FROM inventory_moves WHERE id=$1 FOR UPDATE',[original.id]),m=locked.rows[0];
+   if(!['in','consume','sale','waste'].includes(m.type))throw fail(400,'این نوع گردش از فرم اختصاصی خودش اصلاح می‌شود');
+   if(m.type==='in'&&!canPrice(req.user))throw fail(403,'ویرایش خرید به مجوز قیمت‌ها نیاز دارد');
+   const amount=quantity(b.quantity),valueIn=m.type==='in'?cash(b.totalCost):null;
+   if(amount===null||amount<=0||m.type==='in'&&valueIn===null)throw fail(400,'مقدار و مبلغ معتبر وارد کنید');
+   let vehicleId=m.type==='consume'?(b.vehicleId||null):null;
+   if(vehicleId){if(!uuid(vehicleId))throw fail(400,'خودرو معتبر نیست');const v=await c.query('SELECT id FROM inventory_vehicles WHERE id=$1 AND scope=$2',[vehicleId,req.inventoryScope]);if(!v.rowCount)throw fail(400,'خودرو در این انبار تعریف نشده است')}
+   if(m.type==='consume'&&!vehicleId&&!text(b.reason,500))throw fail(400,'خودرو یا دلیل مصرف عمومی لازم است');
+   const changesStock=amount!==Number(m.quantity)||m.type==='in'&&valueIn!==Number(m.value_amount);
+   let value=Number(m.value_amount);
+   if(changesStock){
+    const last=await c.query("SELECT id FROM inventory_moves WHERE item_id=$1 AND type NOT IN ('loan','loan_return') ORDER BY created_at DESC,id DESC LIMIT 1",[i.id]);
+    if(last.rows[0]?.id!==m.id)throw fail(409,'برای این کالا گردش بعدی ثبت شده است؛ مقدار یا قیمت را با شمارش اصلاحی یا برگشت مصرف اصلاح کنید');
+    const incoming=m.type==='in',restoredQty=qty(Number(i.quantity)+(incoming?-1:1)*Number(m.quantity)),restoredValue=Number(i.stock_value)+(incoming?-1:1)*Number(m.value_amount);
+    value=incoming?valueIn:costOf({quantity:restoredQty,stock_value:restoredValue},amount);
+    const newQty=qty(restoredQty+(incoming?1:-1)*amount),newValue=restoredValue+(incoming?1:-1)*value;
+    if(newQty<Number(i.loaned)||newQty>1e9||newValue<0||!Number.isSafeInteger(newValue))throw fail(409,'اصلاح باعث موجودی منفی یا مقدار نامعتبر می‌شود');
+    if(m.transaction_id){const payment=await c.query('SELECT amount FROM transactions WHERE id=$1 AND deleted_at IS NULL',[m.transaction_id]);if(!payment.rowCount||value<Number(payment.rows[0].amount))throw fail(409,'مبلغ خرید نمی‌تواند از پرداخت مالی متصل کمتر باشد')}
+    await c.query('UPDATE inventory_items SET quantity=$1,stock_value=$2,updated_at=NOW() WHERE id=$3',[newQty,newValue,i.id]);
+   }
+   // A returned consumption cannot be reassigned to another vehicle.
+   if(vehicleId!==m.vehicle_id){const r=await c.query("SELECT id FROM inventory_moves WHERE reference_id=$1 AND type='return'",[m.id]);if(r.rowCount)throw fail(409,'برای این مصرف برگشت ثبت شده؛ ارتباط خودرو قابل تغییر نیست')}
+   const happened=date(b.date);
+   await c.query('UPDATE inventory_moves SET quantity=$1,value_amount=$2,party=$3,reason=$4,invoice=$5,vehicle_id=$6,happened_at=$7 WHERE id=$8',[amount,value,text(b.party,120),text(b.reason,500),m.type==='in'?text(b.invoice,100):m.invoice,vehicleId,happened,m.id]);
+   const after={...m,quantity:amount,value_amount:value,party:text(b.party,120),reason:text(b.reason,500),invoice:m.type==='in'?text(b.invoice,100):m.invoice,vehicle_id:vehicleId,happened_at:happened};
+   await c.query('INSERT INTO inventory_move_edits(id,move_id,scope,actor_id,actor_name,before_data,after_data) VALUES($1,$2,$3,$4,$5,$6,$7)',[crypto.randomUUID(),m.id,req.inventoryScope,req.user.sub,req.user.name,JSON.stringify(m),JSON.stringify(after)]);
+   return {id:m.id};
+  }));
+ }));
+ router.get('/movements/:id/history',wrap(async(req,res)=>{
+  if(!uuid(req.params.id))throw fail(400,'شناسه معتبر نیست');
+  const r=await q('SELECT actor_name,edited_at,before_data,after_data FROM inventory_move_edits WHERE move_id=$1 AND scope=$2 ORDER BY edited_at DESC',[req.params.id,req.inventoryScope]);
+  const redact=data=>{const {value_amount,transaction_id,...safe}=data;return {...safe,...(canPrice(req.user)?{value_amount,transaction_id}:{})}};
+  res.json(r.rows.map(h=>({...h,before_data:redact(h.before_data),after_data:redact(h.after_data)})));
+ }));
  router.get('/finance-expenses',priced,wrap(async(req,res)=>{if(req.inventoryScope!=='services'||!(owner(req.user)||(req.user.finance_access&&req.user.finance_edit&&!req.user.finance_entry_only)))throw fail(403,'دسترسی به اسناد مالی ندارید');const r=await q("SELECT t.id,t.description,t.amount::text,t.happened_at FROM transactions t WHERE kind='expense' AND deleted_at IS NULL AND NOT EXISTS(SELECT 1 FROM inventory_moves m WHERE m.transaction_id=t.id) ORDER BY t.happened_at DESC LIMIT 200");res.json(r.rows.map(t=>({...t,amount:Number(t.amount)})))}));
  router.post('/returns',write,wrap(async(req,res)=>{const b=req.body,n=quantity(b.quantity);if(!uuid(b.referenceId)||n===null||n<=0||!text(b.reason,500))throw fail(400,'سند مصرف، مقدار و دلیل برگشت لازم است');res.status(201).json(await atomic(req,async c=>{const prior=await c.query("SELECT * FROM inventory_moves WHERE id=$1 AND scope=$2 AND type='consume'",[b.referenceId,req.inventoryScope]);if(!prior.rowCount)throw fail(404,'سند مصرف پیدا نشد');const m=prior.rows[0],i=await item(c,m.item_id,req.inventoryScope);await c.query('SELECT id FROM inventory_moves WHERE id=$1 FOR UPDATE',[m.id]);const r=await c.query("SELECT COALESCE(SUM(quantity),0) AS quantity,COALESCE(SUM(value_amount),0) AS value FROM inventory_moves WHERE reference_id=$1 AND type='return'",[m.id]);const remaining=qty(Number(m.quantity)-Number(r.rows[0].quantity));if(n>remaining)throw fail(409,'بیش از مقدار مصرف‌شده قابل برگشت نیست');const value=n===remaining?Number(m.value_amount)+Number(r.rows[0].value):Math.round(Number(m.value_amount)*n/Number(m.quantity));await c.query('UPDATE inventory_items SET quantity=quantity+$1,stock_value=stock_value+$2,updated_at=NOW() WHERE id=$3',[n,value,i.id]);return {id:await move(c,req,i,{type:'return',quantity:n,value:-value,vehicleId:m.vehicle_id,referenceId:m.id,reason:b.reason,party:b.party})}}))}));
  router.post('/counts',write,onlyOwner,wrap(async(req,res)=>{const b=req.body,n=quantity(b.actual);if(n===null||!text(b.reason,500))throw fail(400,'شمارش واقعی و دلیل اختلاف لازم است');res.status(201).json(await atomic(req,async c=>{const i=await item(c,b.itemId,req.inventoryScope);if(n<Number(i.loaned))throw fail(409,'شمارش کل نمی‌تواند از تعداد ابزار نزد همکاران کمتر باشد');const delta=qty(n-Number(i.quantity));if(!delta)throw fail(400,'شمارش با موجودی برابر است');const price=cash(b.unitCost);let value=delta<0?-costOf(i,-delta):price===null?NaN:Math.round(delta*price);if(!Number.isSafeInteger(value))throw fail(400,'قیمت هر واحد افزایش موجودی لازم است');await c.query('UPDATE inventory_items SET quantity=$1,stock_value=stock_value+$2,updated_at=NOW() WHERE id=$3',[n,value,i.id]);return {id:await move(c,req,i,{type:'count',quantity:delta,value,reason:b.reason})}}))}));
  router.post('/loans',write,wrap(async(req,res)=>{const b=req.body,n=quantity(b.quantity);if(n===null||n<=0||!text(b.person,120))throw fail(400,'نام تحویل‌گیرنده و مقدار لازم است');res.status(201).json(await atomic(req,async c=>{const i=await item(c,b.itemId,req.inventoryScope);if(i.category!=='ابزار و تجهیزات')throw fail(400,'امانت برای ابزار و تجهیزات است');if(n>qty(Number(i.quantity)-Number(i.loaned)))throw fail(409,'ابزار آزاد کافی نیست');const id=crypto.randomUUID();await c.query('INSERT INTO inventory_loans(id,item_id,scope,quantity,person,due_date,created_by) VALUES($1,$2,$3,$4,$5,$6,$7)',[id,i.id,req.inventoryScope,n,text(b.person,120),day(b.dueDate),req.user.sub]);await c.query('UPDATE inventory_items SET loaned=loaned+$1,updated_at=NOW() WHERE id=$2',[n,i.id]);await move(c,req,i,{type:'loan',quantity:n,party:b.person,reason:'تحویل ابزار امانی'});return {id}}))}));
  router.post('/loans/:id/return',write,wrap(async(req,res)=>{if(!uuid(req.params.id))throw fail(400,'امانت معتبر نیست');res.json(await atomic(req,async c=>{const r=await c.query('SELECT * FROM inventory_loans WHERE id=$1 AND scope=$2',[req.params.id,req.inventoryScope]);if(!r.rowCount)throw fail(404,'امانت پیدا نشد');const l=r.rows[0],i=await item(c,l.item_id,req.inventoryScope);const locked=await c.query('SELECT returned_at FROM inventory_loans WHERE id=$1 FOR UPDATE',[l.id]);if(locked.rows[0].returned_at)throw fail(409,'ابزار قبلاً برگشته است');await c.query('UPDATE inventory_loans SET returned_at=NOW(),returned_by=$1 WHERE id=$2',[req.user.sub,l.id]);await c.query('UPDATE inventory_items SET loaned=loaned-$1,updated_at=NOW() WHERE id=$2',[l.quantity,i.id]);await move(c,req,i,{type:'loan_return',quantity:Number(l.quantity),party:l.person,reason:'بازگشت ابزار امانی'});return {id:l.id}}))}));
- router.post('/transfers',write,onlyOwner,wrap(async(req,res)=>{const b=req.body,n=quantity(b.quantity),dest=b.destination;if(!SCOPES.includes(dest)||dest===req.inventoryScope||n===null||n<=0||!text(b.reason,500))throw fail(400,'انبار مقصد، مقدار و دلیل معتبر لازم است');res.status(201).json(await atomic(req,async c=>{await c.query('SELECT pg_advisory_xact_lock(7832315)');const i=await item(c,b.itemId,req.inventoryScope);if(n>qty(Number(i.quantity)-Number(i.loaned)))throw fail(409,'موجودی آزاد کافی نیست');const target=await c.query('SELECT * FROM inventory_items WHERE scope=$1 AND sku=$2 FOR UPDATE',[dest,i.sku]);let t=target.rows[0];if(t&&(t.unit!==i.unit||t.category!==i.category||!t.active))throw fail(409,'کد کالا در مقصد با واحد یا دسته متفاوت تعریف شده است');if(!t){t={...i,id:crypto.randomUUID(),scope:dest};await c.query('INSERT INTO inventory_items(id,scope,sku,name,category,unit,purchase_unit,pack_size,min_stock,location) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)',[t.id,dest,i.sku,i.name,i.category,i.unit,i.purchase_unit,i.pack_size,i.min_stock,i.location])}const value=costOf(i,n),transferId=crypto.randomUUID();await c.query('UPDATE inventory_items SET quantity=quantity-$1,stock_value=stock_value-$2,updated_at=NOW() WHERE id=$3',[n,value,i.id]);await c.query('UPDATE inventory_items SET quantity=quantity+$1,stock_value=stock_value+$2,updated_at=NOW() WHERE id=$3',[n,value,t.id]);await move(c,req,i,{type:'transfer_out',quantity:n,value,reason:b.reason,transferId});await move(c,req,t,{type:'transfer_in',quantity:n,value,reason:b.reason,transferId});return {id:transferId}}))}));
+ router.post('/transfers',write,onlyOwner,wrap(async(req,res)=>{const b=req.body,n=quantity(b.quantity),dest=b.destination;if(!canAccess(req.user,dest)||dest===req.inventoryScope||n===null||n<=0||!text(b.reason,500))throw fail(400,'انبار مقصد، مقدار و دلیل معتبر لازم است');res.status(201).json(await atomic(req,async c=>{await c.query('SELECT pg_advisory_xact_lock(7832315)');const i=await item(c,b.itemId,req.inventoryScope);if(n>qty(Number(i.quantity)-Number(i.loaned)))throw fail(409,'موجودی آزاد کافی نیست');const target=await c.query('SELECT * FROM inventory_items WHERE scope=$1 AND sku=$2 FOR UPDATE',[dest,i.sku]);let t=target.rows[0];if(t&&(t.unit!==i.unit||t.category!==i.category||!t.active))throw fail(409,'کد کالا در مقصد با واحد یا دسته متفاوت تعریف شده است');if(!t){t={...i,id:crypto.randomUUID(),scope:dest};await c.query('INSERT INTO inventory_items(id,scope,sku,name,category,unit,purchase_unit,pack_size,min_stock,location) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)',[t.id,dest,i.sku,i.name,i.category,i.unit,i.purchase_unit,i.pack_size,i.min_stock,i.location])}const value=costOf(i,n),transferId=crypto.randomUUID();await c.query('UPDATE inventory_items SET quantity=quantity-$1,stock_value=stock_value-$2,updated_at=NOW() WHERE id=$3',[n,value,i.id]);await c.query('UPDATE inventory_items SET quantity=quantity+$1,stock_value=stock_value+$2,updated_at=NOW() WHERE id=$3',[n,value,t.id]);await move(c,req,i,{type:'transfer_out',quantity:n,value,reason:b.reason,transferId});await move(c,req,t,{type:'transfer_in',quantity:n,value,reason:b.reason,transferId});return {id:transferId}}))}));
  app.use('/api/inventory',router);
 }
-module.exports={initInventory,installInventory,quantity,cash,costOf,canAccess,canPrice};
+module.exports={initInventory,installInventory,quantity,cash,costOf,canAccess,canPrice,canManage};

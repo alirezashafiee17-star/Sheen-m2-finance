@@ -4,8 +4,12 @@ const leadStatus={followup:"پیگیری",visit:"هماهنگی بازدید",ne
 const ownerType={owned:"خرید نمایشگاه",consignment:"امانی"};
 function showModule(module){
  if(!currentUser)return;
- if(module==="entry"&&!currentUser.financeEntryOnly||module==="finance"&&(!currentUser.financeAccess||currentUser.financeEntryOnly)||module==="showroom"&&!currentUser.showroomAccess||module==="scout"&&!currentUser.scoutAccess)return;
- $("#modulePicker").hidden=module==="entry"||[currentUser.financeAccess,currentUser.showroomAccess,currentUser.scoutAccess].filter(Boolean).length<2;
+ if(module==="entry"&&!currentUser.financeEntryOnly||module==="finance"&&(!currentUser.financeAccess||currentUser.financeEntryOnly)||module==="showroom"&&!currentUser.showroomAccess||module==="scout"&&!currentUser.scoutAccess||module==="inventory"&&!currentUser.inventoryAccess)return;
+ $("#modulePicker").hidden=module==="entry"||[currentUser.financeAccess,currentUser.showroomAccess,currentUser.scoutAccess,currentUser.inventoryAccess].filter(Boolean).length<2;
+ $("#inventoryModule").hidden=!currentUser.inventoryAccess;
+ $("#inventoryArea").hidden=module!=="inventory";
+ $("#inventoryModule").className=module==="inventory"?"primary":"ghost";
+ if(module==="inventory"&&window.loadInventory)window.loadInventory().catch(e=>toast(e.message));
  $("#financeModule").hidden=!currentUser.financeAccess||currentUser.financeEntryOnly;
  $("#showroomModule").hidden=!currentUser.showroomAccess;
  $("#scoutModule").hidden=!currentUser.scoutAccess;
@@ -15,8 +19,8 @@ function showModule(module){
  $("#scoutArea").hidden=module!=="scout";
  $("#financeNav").hidden=module!=="finance";
  $("#add").hidden=module!=="finance";
- $(".header .brand span").textContent=module==="finance"||module==="entry"?"FINANCE":module==="scout"?"SCOUT":"GALLERY";
- document.title=module==="entry"?"ثبت تراکنش شین":module==="finance"?"Sheen Finance":module==="scout"?"SHEEN SCOUT":"Sheen Gallery";
+ $(".header .brand span").textContent=module==="finance"||module==="entry"?"FINANCE":module==="scout"?"SCOUT":module==="inventory"?"INVENTORY":"GALLERY";
+ document.title=module==="entry"?"ثبت تراکنش شین":module==="finance"?"Sheen Finance":module==="scout"?"SHEEN SCOUT":module==="inventory"?"انبار شین":"Sheen Gallery";
  if(module==="scout"&&window.loadScout)window.loadScout().catch(e=>toast(e.message));
  $("#financeModule").className=module==="finance"?"primary":"ghost";
  $("#showroomModule").className=module==="showroom"?"primary":"ghost";
@@ -37,13 +41,14 @@ function renderShowroom(){
  $("#showroomListPanel").hidden=showroomTab==="report";$("#showroomReport").hidden=showroomTab!=="report";$("#showroomPrintActions").hidden=showroomTab!=="report";
  $$(".showroom-tab").forEach(b=>b.classList.toggle("primary",b.dataset.showroom===showroomTab));
  let html="";
- if(showroomTab==="cars")html=showroomCars.map(c=>`<div class="showroom-row"><div><strong>${esc(c.title)} ${esc(c.year)}</strong><small>${esc(ownerType[c.ownership])} · ${esc(carStatus[c.status])} · ${esc(c.paint||"وضعیت بدنه ثبت نشده")}<br>کارکرد ${new Intl.NumberFormat("fa-IR").format(c.mileage)} · قیمت پیشنهادی ${toman(c.askingPrice)}</small>${carPhotoHTML(c.id)}</div>${currentUser.showroomEdit?`<button class="edit" data-car="${c.id}">ویرایش</button>`:""}</div>`).join("");
+ if(showroomTab==="cars")html=showroomCars.map(c=>`<div class="showroom-row"><div><strong>${esc(c.title)} ${esc(c.year)}</strong><small>${esc(ownerType[c.ownership])} · ${esc(carStatus[c.status])} · ${esc(c.paint||"وضعیت بدنه ثبت نشده")}<br>کارکرد ${new Intl.NumberFormat("fa-IR").format(c.mileage)} · قیمت پیشنهادی ${toman(c.askingPrice)}</small>${carPhotoHTML(c.id)}${currentUser.inventoryAccess&&["gallery","both"].includes(currentUser.inventoryScope)?`<button class="ghost small-btn" data-car-inventory="${c.id}">مصرف و قطعات انبار</button>`:""}</div>${currentUser.showroomEdit?`<button class="edit" data-car="${c.id}">ویرایش</button>`:""}</div>`).join("");
  if(showroomTab==="leads")html=showroomLeads.map(l=>`<div class="showroom-row"><div><strong>${esc(l.customerName)}</strong><small>${esc(l.carTitle||"بدون خودرو")} · ${esc(leadStatus[l.status])}<br>${l.nextFollowup?"پیگیری: "+fmtDate(l.nextFollowup):"زمان پیگیری تعیین نشده"} ${l.phone?" · "+esc(l.phone):""}</small></div>${currentUser.showroomEdit?`<button class="edit" data-lead="${l.id}">ویرایش</button>`:""}</div>`).join("");
  if(showroomTab==="deals")html=showroomDeals.map(d=>`<div class="showroom-row"><div><strong>${esc(d.carTitle)}</strong><small>فروش ${toman(d.saleAmount)} · خرید/تسویه ${toman(d.acquisitionAmount)}<br>هزینه ${toman(d.expenseAmount)} · کمیسیون جداگانه ${toman(d.commissionAmount)}<br>سود نمایشگاه: ${toman(d.saleAmount-d.acquisitionAmount-d.expenseAmount+d.commissionAmount)}</small></div>${currentUser.showroomEdit?`<button class="edit" data-deal="${d.id}">ویرایش</button>`:""}</div>`).join("");
  if(showroomTab==="withdrawals")html=showroomWithdrawals.map(w=>`<div class="showroom-row"><div><strong>${toman(w.amount)}</strong><small>${fmtDate(w.happenedAt)} · ${esc(w.description)}</small></div>${currentUser.showroomEdit?`<button class="edit" data-withdrawal="${w.id}">ویرایش</button>`:""}</div>`).join("");
  if(showroomTab==="agencies")html='<div class="period-note">تأیید از لینک اختصاصی بدون پیامک ثبت می‌شود. هویت مالک را هنگام بررسی مدارک کنترل کنید.</div>'+showroomAgencies.map(a=>`<div class="showroom-row"><div><strong>${esc(a.carTitle)} · نسخهٔ ${esc(a.version)}</strong><small>مالک: ${esc(a.ownerName)} · قیمت خالص: ${toman(a.netPrice)}<br>${esc(({draft:"آماده‌سازی",owner_submitted:"تأیید مالک؛ در انتظار بررسی",approved:"تأیید نهایی شین",revision_requested:"نیاز به اصلاح",superseded:"نسخهٔ جایگزین",expired:"منقضی‌شده"})[a.status]||a.status)} · اعتبار تا ${fmtDate(a.expiresAt)}${a.ownerCorrection?"<br>درخواست مالک: "+esc(a.ownerCorrection):""}</small></div><button class="edit" data-agency-docs="${a.id}">مدارک و بررسی</button></div>`).join("");
  if(showroomTab==="report")renderShowroomReport();
  $("#showroomRows").innerHTML=html||'<div class="empty">هنوز موردی ثبت نشده است.</div>';
+ $$("[data-car-inventory]").forEach(b=>b.onclick=()=>window.openInventoryForCar?.(b.dataset.carInventory));
  $$("[data-car]").forEach(b=>b.onclick=()=>openShowroom("cars",showroomCars.find(c=>c.id===b.dataset.car)));
  $$("[data-lead]").forEach(b=>b.onclick=()=>openShowroom("leads",showroomLeads.find(l=>l.id===b.dataset.lead)));
  $$("[data-deal]").forEach(b=>b.onclick=()=>openShowroom("deals",showroomDeals.find(d=>d.id===b.dataset.deal)));
@@ -167,3 +172,6 @@ async function openAgencyDocuments(agencyId){
   dialog.showModal();
  }catch(e){toast(e.message)}
 }
+
+
+$("#inventoryModule").onclick=()=>showModule("inventory");

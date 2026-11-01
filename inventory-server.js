@@ -144,7 +144,7 @@ function installInventory(app,{q,pool,auth,periodOf,currentPeriod}){
   res.json(await atomic(req,async c=>{
    const initial=await c.query('SELECT * FROM inventory_moves WHERE id=$1 AND scope=$2',[req.params.id,req.inventoryScope]);
    if(!initial.rowCount)throw fail(404,'گردش انبار پیدا نشد');
-   const original=initial.rows[0],i=await item(c,original.item_id,req.inventoryScope);
+   const original=initial.rows[0];if(original.invoice_id)throw fail(409,'این گردش به فاکتور متصل است؛ از بخش فاکتورها ویرایش کنید');const i=await item(c,original.item_id,req.inventoryScope);
    const locked=await c.query('SELECT * FROM inventory_moves WHERE id=$1 FOR UPDATE',[original.id]),m=locked.rows[0];
    if(!['in','consume','sale','waste'].includes(m.type))throw fail(400,'این نوع گردش از فرم اختصاصی خودش اصلاح می‌شود');
    if(m.type==='in'&&!canPrice(req.user))throw fail(403,'ویرایش خرید به مجوز قیمت‌ها نیاز دارد');

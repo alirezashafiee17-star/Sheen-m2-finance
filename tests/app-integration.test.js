@@ -15,7 +15,7 @@ test('full app: migration, login, inventory-only member, UI forms, and linked fi
   const listed=await call('/members',null,token);assert.equal(listed.data[0].inventoryScope,'services');assert.equal(listed.data[0].inventoryAccess,true);
   const login=await call('/auth/login',{email:member.email,password:member.password});assert.equal(login.status,200);assert.equal(login.data.user.inventoryAccess,true);assert.equal(login.data.user.inventoryPrices,false);assert.equal((await call('/transactions',null,login.data.token)).status,403);assert.equal((await call('/inventory?scope=gallery',null,login.data.token)).status,403);
   dom=new JSDOM(fs.readFileSync(path.resolve(__dirname,'../index.html'),'utf8'),{url:origin,runScripts:'dangerously',pretendToBeVisual:true});const w=dom.window;w.fetch=(url,opt)=>fetch(new URL(url,origin),opt);w.scrollTo=()=>{};w.HTMLDialogElement.prototype.showModal=function(){this.open=true};w.HTMLDialogElement.prototype.close=function(){this.open=false};w.confirm=()=>true;
-  for(const file of ['app.js','showroom.js','scout.js','inventory.js']){const script=w.document.createElement('script');script.textContent=fs.readFileSync(path.resolve(__dirname,'..',file),'utf8');w.document.body.appendChild(script)}
+  for(const file of ['app.js','showroom.js','scout.js','inventory.js','reception.js']){const script=w.document.createElement('script');script.textContent=fs.readFileSync(path.resolve(__dirname,'..',file),'utf8');w.document.body.appendChild(script)}
   const $=id=>w.document.getElementById(id);$('loginEmail').value=member.email;$('loginPassword').value=member.password;await $('loginBtn').onclick();assert.equal($('authGate').classList.contains('hidden'),true,$('authText').textContent);assert.equal($('inventoryArea').hidden,false);assert.equal($('financeArea').hidden,true);assert.equal($('financeNav').hidden,true);assert.equal($('ivIn').hidden,true);assert.equal($('ivOut').hidden,false);
   $('ivAdd').click();assert.equal($('inventoryModal').open,true);const form=$('ivForm');assert.equal(form.elements.packSize.closest('details').open,false);assert.ok(form.elements.sku.value.startsWith('SH-'));assert.equal(form.elements.unitCost,undefined);assert.equal(form.elements.opening,undefined);form.elements.name.value='Test item';form.elements.sku.value='TEST';form.elements.minStock.value='2';await form.onsubmit({target:form,preventDefault(){}});assert.equal($('ivFormError').textContent,'');assert.ok($('ivBody').textContent.includes('Test item'));assert.ok($('ivBody').querySelector('.iv-product'));assert.equal($('ivBody').querySelector('table'),null);assert.ok(!$('ivStats').textContent.includes('ارزش'));
   // Open the owner account and verify member permissions survive edit.
@@ -60,6 +60,27 @@ test('full app: migration, login, inventory-only member, UI forms, and linked fi
   const logs=await query('SELECT * FROM transaction_edits WHERE transaction_id=$1',[own[10]]);assert.ok(logs.rowCount>=1);
   assert.equal((await call('/members/'+created.data.id,{...combined,financeEdit:false},token,'PUT')).status,200);
   assert.equal((await call('/transactions/'+own[10],edit,limited,'PUT')).status,403);
+  // A reception-only member can enter the independent module and use its complete workflow.
+  const receptionist={...member,name:'Reception clerk',email:'reception@example.invalid',inventoryAccess:false,inventoryEdit:false,receptionAccess:true,receptionEdit:true};
+  const createdReceptionist=await call('/members',receptionist,token);assert.equal(createdReceptionist.status,201);
+  $('logout').onclick();$('loginEmail').value='owner@example.invalid';$('loginPassword').value='Test-only-secret-123';await $('loginBtn').onclick();
+  w.eval("openMember(members.find(m=>m.email==='reception@example.invalid'))");assert.equal($('memberReception').checked,true);assert.equal($('memberReceptionEdit').checked,true);assert.equal($('memberFinance').checked,false);await w.eval('saveMember()');
+  const receptionistLogin=await call('/auth/login',{email:receptionist.email,password:receptionist.password});assert.equal(receptionistLogin.data.user.receptionAccess,true);assert.equal(receptionistLogin.data.user.receptionEdit,true);
+  const beforeFinance=await query('SELECT COUNT(*)::int AS n FROM transactions'),beforeMoves=await query('SELECT COUNT(*)::int AS n FROM inventory_moves');
+  $('logout').onclick();$('loginEmail').value=receptionist.email;$('loginPassword').value=receptionist.password;await $('loginBtn').onclick();
+  assert.equal($('receptionArea').hidden,false);assert.equal($('inventoryArea').hidden,true);assert.equal($('financeArea').hidden,true);assert.equal($('modulePicker').hidden,true);
+  $('rcNew').click();assert.equal($('receptionFormModal').open,true);const rf=$('rcForm');
+  rf.elements.customerName.value='Test reception customer';rf.elements.phone.value='۰۹۱۲۱۲۳۴۵۶۷';rf.elements.model.value='Test vehicle';rf.elements.plate.value='۱۲ ب ۳۴۵';rf.elements.services.value='Polish body';rf.elements.condition.value='<script>damage note</script>';rf.elements.dueDate.value='۱۴۰۵/۰۸/۱۲';rf.elements.dueTime.value='۱۸:۳۰';
+  await rf.onsubmit({preventDefault(){},target:rf});assert.equal($('rcFormError').textContent,'');assert.equal($('receptionDetailModal').open,true);assert.ok($('rcDetail').textContent.includes('Test reception customer'));assert.equal($('rcDetail').querySelector('script'),null);
+  assert.ok($('rcDetail').textContent.includes('۱۸:۳۰'));await $('rcAdvance').onclick();assert.ok($('rcDetail').textContent.includes('در حال انجام'));
+  $('rcEdit').click();rf.elements.services.value='Corrected services';await rf.onsubmit({preventDefault(){},target:rf});assert.equal($('rcFormError').textContent,'');assert.ok($('rcDetail').textContent.includes('Corrected services'));
+  $('rcStatus').value='delivered';await $('rcStatusSave').onclick();assert.equal($('rcEdit'),null);assert.equal($('rcPhotoInput'),null);assert.ok($('rcDetail').textContent.includes('زمان تحویل واقعی'));
+  assert.equal((await query('SELECT COUNT(*)::int AS n FROM transactions')).rows[0].n,beforeFinance.rows[0].n);assert.equal((await query('SELECT COUNT(*)::int AS n FROM inventory_moves')).rows[0].n,beforeMoves.rows[0].n);
+  const receptionistToken=receptionistLogin.data.token,record=(await call('/reception',null,receptionistToken)).data.items[0];
+  assert.equal((await call('/members/'+createdReceptionist.data.id,{...receptionist,receptionEdit:false},token,'PUT')).status,200);
+  assert.equal((await call('/reception/'+record.id+'/status',{status:'working',version:record.version},receptionistToken,'PATCH')).status,403);
+  assert.equal((await call('/inventory',null,receptionistToken)).status,403);assert.equal((await call('/transactions',null,receptionistToken)).status,403);
+  $('logout').onclick();assert.equal($('rcList').textContent,'');assert.equal($('rcDetail').textContent,'');
   assert.deepEqual(errors,[]);
  }finally{dom?.window.close();if(server)await new Promise(r=>server.close(r));await db.close()}
 });

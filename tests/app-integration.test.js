@@ -43,6 +43,20 @@ test('full app: migration, login, inventory-only member, UI forms, and linked fi
   assert.equal((await call('/transactions/'+own[10],null,limited,'DELETE')).status,403);
   await w.eval('loadAll()');assert.ok($('entryRecent').querySelector('[data-edit]'));assert.equal($('entryRecent').querySelector('[data-delete]'),null);
   $('entryRecent').querySelector('[data-edit]').click();assert.equal($('modal').open,true);$('desc').value='UI recent edit';await w.eval('saveTransaction()');assert.ok($('entryRecent').textContent.includes('UI recent edit'));
+  // Managers confirm deletion, can restore it, and cannot delete stocked items.
+  $('inventoryModule').click();await w.loadInventory();w.document.querySelector('[data-ivtab="stock"]').click();
+  $('ivAdd').click();form.elements.name.value='Disposable item';form.elements.sku.value='UI-DELETE';
+  await form.onsubmit({target:form,preventDefault(){}});
+  const card=[...$('ivBody').querySelectorAll('.iv-product')].find(e=>e.textContent.includes('Disposable item'));
+  card.querySelector('[data-iv-delete]').click();assert.equal($('inventoryModal').open,true);assert.equal($('ivSubmit').disabled,false);
+  $('ivCancel').click();assert.ok($('ivBody').textContent.includes('Disposable item'));
+  card.querySelector('[data-iv-delete]').click();await form.onsubmit({target:form,preventDefault(){}});
+  assert.equal($('ivFormError').textContent,'');assert.ok(!$('ivBody').textContent.includes('Disposable item'));
+  w.document.querySelector('[data-ivtab="deleted"]').click();assert.ok($('ivBody').textContent.includes('Disposable item'));
+  $('ivBody').querySelector('[data-iv-restore]').click();assert.equal($('ivSubmit').disabled,false);await form.onsubmit({target:form,preventDefault(){}});
+  w.document.querySelector('[data-ivtab="stock"]').click();assert.ok($('ivBody').textContent.includes('Disposable item'));
+  const stocked=[...$('ivBody').querySelectorAll('.iv-product')].find(e=>e.textContent.includes('Test item'));
+  stocked.querySelector('[data-iv-delete]').click();assert.equal($('ivSubmit').disabled,true);assert.match($('ivHelp').textContent,/موجودی/);$('ivCancel').click();
   const logs=await query('SELECT * FROM transaction_edits WHERE transaction_id=$1',[own[10]]);assert.ok(logs.rowCount>=1);
   assert.equal((await call('/members/'+created.data.id,{...combined,financeEdit:false},token,'PUT')).status,200);
   assert.equal((await call('/transactions/'+own[10],edit,limited,'PUT')).status,403);

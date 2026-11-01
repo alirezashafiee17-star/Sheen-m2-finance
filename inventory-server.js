@@ -101,6 +101,25 @@ function installInventory(app,{q,pool,auth,periodOf,currentPeriod}){
   const result=await atomic(req,async c=>{const id=crypto.randomUUID();await c.query(`INSERT INTO inventory_items(id,scope,sku,name,category,unit,purchase_unit,pack_size,min_stock,location,barcode,notes,quantity,stock_value) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`,[id,req.inventoryScope,sku,n,category,unit,text(b.purchaseUnit,30)||unit,pack,minimum,text(b.location,100),text(b.barcode,100),text(b.notes,1000),opening,Math.round(opening*price)]);if(opening>0)await move(c,req,{id,scope:req.inventoryScope},{type:'opening',quantity:opening,value:Math.round(opening*price),reason:'موجودی اولیه'});return {id}});res.status(201).json(result);
  }));
  router.put('/items/:id',write,wrap(async(req,res)=>{const b=req.body,minimum=quantity(b.minStock);if(!text(b.name,150)||minimum===null)throw fail(400,'نام کالا و حداقل موجودی معتبر لازم است');res.json(await atomic(req,async c=>{const i=await item(c,req.params.id,req.inventoryScope);await c.query('UPDATE inventory_items SET name=$1,min_stock=$2,location=$3,barcode=$4,notes=$5,updated_at=NOW() WHERE id=$6',[text(b.name,150),minimum,text(b.location,100),text(b.barcode,100),text(b.notes,1000),i.id]);return {id:i.id}}))}));
+ // Keep movement/finance references intact; only empty items may leave the active catalog.
+ router.delete('/items/:id',onlyOwner,wrap(async(req,res)=>{
+  res.json(await atomic(req,async c=>{
+   const i=await item(c,req.params.id,req.inventoryScope);
+   if(Number(i.loaned)>0)throw fail(409,'ابتدا ابزار امانی این کالا را پس بگیرید');
+   if(Number(i.quantity)>0||Number(i.stock_value)>0)throw fail(409,'این کالا هنوز موجودی دارد؛ ابتدا خروج کالا یا اصلاح تعداد موجودی را ثبت کنید');
+   await c.query('UPDATE inventory_items SET active=false,updated_at=NOW() WHERE id=$1',[i.id]);
+   return {id:i.id,active:false};
+  }));
+ }));
+ router.post('/items/:id/restore',onlyOwner,wrap(async(req,res)=>{
+  if(!uuid(req.params.id))throw fail(400,'شناسه کالا معتبر نیست');
+  res.json(await atomic(req,async c=>{
+   const r=await c.query('SELECT * FROM inventory_items WHERE id=$1 AND scope=$2 FOR UPDATE',[req.params.id,req.inventoryScope]);
+   if(!r.rowCount)throw fail(404,'کالا در این انبار پیدا نشد');
+   await c.query('UPDATE inventory_items SET active=true,updated_at=NOW() WHERE id=$1',[r.rows[0].id]);
+   return {id:r.rows[0].id,active:true};
+  }));
+ }));
  router.post('/vehicles',write,wrap(async(req,res)=>{const b=req.body;if(!text(b.title,150)&&!uuid(b.showroomCarId))throw fail(400,'عنوان خودرو را وارد کنید');res.status(201).json(await atomic(req,async c=>{let title=text(b.title,150),car=null;if(b.showroomCarId){if(req.inventoryScope!=='gallery'||!uuid(b.showroomCarId))throw fail(400,'ارتباط خودرو معتبر نیست');const r=await c.query('SELECT id,title,year FROM showroom_cars WHERE id=$1',[b.showroomCarId]);if(!r.rowCount)throw fail(404,'خودرو پیدا نشد');car=r.rows[0].id;title=r.rows[0].title+' '+r.rows[0].year}const id=crypto.randomUUID();await c.query('INSERT INTO inventory_vehicles(id,scope,title,plate,job_number,showroom_car_id) VALUES($1,$2,$3,$4,$5,$6)',[id,req.inventoryScope,title,text(b.plate,40),text(b.jobNumber,80),car]);return {id}}))}));
  router.post('/movements',write,wrap(async(req,res)=>{
   const b=req.body;if(!['in','consume','sale','waste'].includes(b.type))throw fail(400,'نوع گردش معتبر نیست');const n=quantity(b.quantity);if(n===null||n<=0||!text(b.party,120))throw fail(400,'مقدار و تحویل‌گیرنده یا تأمین‌کننده لازم است');if(b.type==='in'&&!canPrice(req.user))throw fail(403,'ورود خرید با قیمت به مجوز قیمت‌ها نیاز دارد');

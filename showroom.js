@@ -4,8 +4,12 @@ const leadStatus={followup:"پیگیری",visit:"هماهنگی بازدید",ne
 const ownerType={owned:"خرید نمایشگاه",consignment:"امانی"};
 function showModule(module){
  if(!currentUser)return;
- if(module==="entry"&&!currentUser.financeEntryOnly||module==="finance"&&(!currentUser.financeAccess||currentUser.financeEntryOnly)||module==="showroom"&&!currentUser.showroomAccess||module==="scout"&&!currentUser.scoutAccess||module==="inventory"&&!currentUser.inventoryAccess||module==="reception"&&!currentUser.receptionAccess)return;
- $("#modulePicker").hidden=[currentUser.financeAccess,currentUser.showroomAccess,currentUser.scoutAccess,currentUser.inventoryAccess,currentUser.receptionAccess].filter(Boolean).length<2;
+ if(module==="entry"&&!currentUser.financeEntryOnly||module==="finance"&&(!currentUser.financeAccess||currentUser.financeEntryOnly)||module==="showroom"&&!currentUser.showroomAccess||module==="scout"&&!currentUser.scoutAccess||module==="inventory"&&!currentUser.inventoryAccess||module==="reception"&&!currentUser.receptionAccess||module==="invoices"&&!currentUser.invoiceAccess)return;
+ $("#modulePicker").hidden=[currentUser.financeAccess,currentUser.showroomAccess,currentUser.scoutAccess,currentUser.inventoryAccess,currentUser.receptionAccess,currentUser.invoiceAccess].filter(Boolean).length<2;
+ $("#invoicesModule").hidden=!currentUser.invoiceAccess;
+ $("#invoiceArea").hidden=module!=="invoices";
+ $("#invoicesModule").className=module==="invoices"?"primary":"ghost";
+ if(module==="invoices"&&window.loadInvoices)window.loadInvoices();
  $("#receptionModule").hidden=!currentUser.receptionAccess;
  $("#receptionArea").hidden=module!=="reception";
  $("#receptionModule").className=module==="reception"?"primary":"ghost";
@@ -24,8 +28,8 @@ function showModule(module){
  $("#scoutArea").hidden=module!=="scout";
  $("#financeNav").hidden=module!=="finance";
  $("#add").hidden=module!=="finance";
- $(".header .brand span").textContent=module==="finance"||module==="entry"?"FINANCE":module==="scout"?"SCOUT":module==="inventory"?"INVENTORY":module==="reception"?"RECEPTION":"GALLERY";
- document.title=module==="entry"?"ثبت تراکنش شین":module==="finance"?"Sheen Finance":module==="scout"?"SHEEN SCOUT":module==="inventory"?"انبار شین":module==="reception"?"پذیرش خودرو شین":"Sheen Gallery";
+ $(".header .brand span").textContent=module==="finance"||module==="entry"?"FINANCE":module==="scout"?"SCOUT":module==="inventory"?"INVENTORY":module==="reception"?"RECEPTION":module==="invoices"?"INVOICES":"GALLERY";
+ document.title=module==="entry"?"ثبت تراکنش شین":module==="finance"?"Sheen Finance":module==="scout"?"SHEEN SCOUT":module==="inventory"?"انبار شین":module==="reception"?"پذیرش خودرو شین":module==="invoices"?"فاکتورهای شین":"Sheen Gallery";
  if(module==="scout"&&window.loadScout)window.loadScout().catch(e=>toast(e.message));
  $("#financeModule").className=module==="finance"||module==="entry"?"primary":"ghost";
  $("#showroomModule").className=module==="showroom"?"primary":"ghost";

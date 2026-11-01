@@ -11,6 +11,7 @@ const {generateRegistrationOptions,verifyRegistrationResponse,generateAuthentica
 
 const {initInventory,installInventory}=require("./inventory-server");
 const {initReception,installReception}=require("./reception-server");
+const {initInvoices,installInvoices}=require("./invoice-server");
 const app=express();
 app.set("trust proxy",1);
 app.use(helmet({contentSecurityPolicy:false}));
@@ -36,7 +37,7 @@ const RP_ID=process.env.PASSKEY_RP_ID||"www.sheenfinance.ir";
 const ORIGIN=process.env.PASSKEY_ORIGIN||"https://www.sheenfinance.ir";
 const passkeyUserID=id=>new Uint8Array(Buffer.from(id.replace(/-/g,""),"hex"));
 const cleanEmail=v=>String(v||"").trim().toLowerCase();
-const publicUser=u=>({id:u.id,name:u.name,email:u.email,role:u.role,displayTitle:u.role==="owner"?"مالک":u.display_title,financeEntryOnly:u.role!=="owner"&&!!u.finance_entry_only,financeEdit:u.role==="owner"||(u.finance_access&&u.finance_edit),financeAccess:u.role==="owner"||u.finance_access,showroomAccess:u.role==="owner"||u.showroom_access,showroomEdit:u.role==="owner"||u.showroom_edit,receptionAccess:u.role==="owner"||!!u.reception_access,receptionEdit:u.role==="owner"||(!!u.reception_access&&!!u.reception_edit),inventoryAccess:u.role==="owner"||u.inventory_access,inventoryManage:u.role==="owner"||u.inventory_manage,inventoryEdit:u.role==="owner"||u.inventory_manage||u.inventory_edit,inventoryPrices:u.role==="owner"||u.inventory_manage||u.inventory_prices,inventoryScope:u.role==="owner"?"both":u.inventory_scope,scoutAccess:u.role==="owner"||u.scout_access});
+const publicUser=u=>({id:u.id,name:u.name,email:u.email,role:u.role,displayTitle:u.role==="owner"?"مالک":u.display_title,financeEntryOnly:u.role!=="owner"&&!!u.finance_entry_only,financeEdit:u.role==="owner"||(u.finance_access&&u.finance_edit),financeAccess:u.role==="owner"||u.finance_access,showroomAccess:u.role==="owner"||u.showroom_access,showroomEdit:u.role==="owner"||u.showroom_edit,invoiceAccess:u.role==="owner"||!!u.invoice_access,invoiceEdit:u.role==="owner"||(!!u.invoice_access&&!!u.invoice_edit),receptionAccess:u.role==="owner"||!!u.reception_access,receptionEdit:u.role==="owner"||(!!u.reception_access&&!!u.reception_edit),inventoryAccess:u.role==="owner"||u.inventory_access,inventoryManage:u.role==="owner"||u.inventory_manage,inventoryEdit:u.role==="owner"||u.inventory_manage||u.inventory_edit,inventoryPrices:u.role==="owner"||u.inventory_manage||u.inventory_prices,inventoryScope:u.role==="owner"?"both":u.inventory_scope,scoutAccess:u.role==="owner"||u.scout_access});
 function sign(u){return jwt.sign({sub:u.id,email:u.email,role:u.role},JWT_SECRET,{expiresIn:"30d"})}
 async function init(){
  await q(`CREATE TABLE IF NOT EXISTS users(
@@ -166,6 +167,7 @@ async function init(){
  await q("ALTER TABLE showroom_agency_documents ADD CONSTRAINT showroom_agency_documents_kind_check CHECK(kind IN ('vehicle','national_front','national_back','power_of_attorney','contract_page_1','contract_page_2'))");
  await initInventory(q);
  await initReception(q);
+ await initInvoices(q);
  const existing=await q("SELECT id FROM users WHERE email=$1",[OWNER_EMAIL]);
  const hash=await bcrypt.hash(OWNER_PASSWORD,12);
  if(!existing.rowCount) await q("INSERT INTO users(id,name,email,password_hash,role) VALUES($1,$2,$3,$4,'owner')",[crypto.randomUUID(),"علیرضا شفیعی",OWNER_EMAIL,hash]);
@@ -173,7 +175,7 @@ async function init(){
 }
 async function auth(req,res,next){
  const token=(req.headers.authorization||"").replace(/^Bearer\s+/i,"");
- try{const payload=jwt.verify(token,JWT_SECRET);const r=await q("SELECT id,name,email,role,display_title,finance_access,finance_edit,finance_entry_only,showroom_access,showroom_edit,scout_access,inventory_access,inventory_edit,inventory_prices,inventory_scope,inventory_manage,reception_access,reception_edit FROM users WHERE id=$1 AND active=true",[payload.sub]);if(!r.rowCount)return res.status(401).json({error:"حساب غیرفعال است"});req.user={...r.rows[0],sub:r.rows[0].id};next()}catch{return res.status(401).json({error:"نیاز به ورود مجدد"})}
+ try{const payload=jwt.verify(token,JWT_SECRET);const r=await q("SELECT id,name,email,role,display_title,finance_access,finance_edit,finance_entry_only,showroom_access,showroom_edit,scout_access,inventory_access,inventory_edit,inventory_prices,inventory_scope,inventory_manage,reception_access,reception_edit,invoice_access,invoice_edit FROM users WHERE id=$1 AND active=true",[payload.sub]);if(!r.rowCount)return res.status(401).json({error:"حساب غیرفعال است"});req.user={...r.rows[0],sub:r.rows[0].id};next()}catch{return res.status(401).json({error:"نیاز به ورود مجدد"})}
 }
 const allow=(...roles)=>(req,res,next)=>roles.includes(req.user.role)?next():res.status(403).json({error:"دسترسی کافی ندارید"});
 const finance=(req,res,next)=>req.user.role==="owner"||(req.user.finance_access&&!req.user.finance_entry_only)?next():res.status(403).json({error:"به بخش مالی دسترسی ندارید"});
@@ -340,6 +342,8 @@ app.put("/api/transactions/:id",auth,financeUpdate,async(req,res)=>{
   }
   const old=await client.query("SELECT * FROM transactions WHERE id=$1 FOR UPDATE",[req.params.id]);
   if(!old.rowCount||old.rows[0].deleted_at){await client.query("ROLLBACK");return res.status(404).json({error:"تراکنش پیدا نشد"})}
+  const linkedInvoice=await client.query("SELECT id FROM invoice_payments WHERE transaction_id=$1",[req.params.id]);
+  if(linkedInvoice.rowCount){await client.query("ROLLBACK");return res.status(409).json({error:"این دریافت به فاکتور متصل است؛ از بخش فاکتورها پیگیری کنید"})}
   const linkedInventory=await client.query("SELECT id FROM inventory_moves WHERE transaction_id=$1",[req.params.id]);
   if(linkedInventory.rowCount){await client.query("ROLLBACK");return res.status(409).json({error:"این سند به خرید انبار متصل است؛ برای اصلاح، سند اصلاحی جدا ثبت کنید"})}
   const before=old.rows[0];
@@ -364,6 +368,8 @@ app.delete("/api/transactions/:id",auth,financeWrite,async(req,res)=>{
   await client.query("BEGIN");
   const old=await client.query("SELECT * FROM transactions WHERE id=$1 FOR UPDATE",[req.params.id]);
   if(!old.rowCount||old.rows[0].deleted_at){await client.query("ROLLBACK");return res.status(404).json({error:"تراکنش پیدا نشد"})}
+  const linkedInvoice=await client.query("SELECT id FROM invoice_payments WHERE transaction_id=$1",[req.params.id]);
+  if(linkedInvoice.rowCount){await client.query("ROLLBACK");return res.status(409).json({error:"این دریافت به فاکتور متصل است؛ از بخش فاکتورها پیگیری کنید"})}
   const linkedInventory=await client.query("SELECT id FROM inventory_moves WHERE transaction_id=$1",[req.params.id]);
   if(linkedInventory.rowCount){await client.query("ROLLBACK");return res.status(409).json({error:"این سند به خرید انبار متصل است؛ برای اصلاح، سند اصلاحی جدا ثبت کنید"})}
   const before=old.rows[0];
@@ -380,29 +386,31 @@ app.delete("/api/transactions/:id",auth,financeWrite,async(req,res)=>{
  }catch(e){await client.query("ROLLBACK").catch(()=>{});console.error("Transaction delete failed",e.code||e.message);res.status(500).json({error:"حذف ذخیره نشد"})}finally{client.release()}
 });
 app.get("/api/periods",auth,async(req,res)=>{await closePastPeriods();const r=await q("SELECT period,closed FROM periods");res.json(Object.fromEntries(r.rows.map(x=>[x.period,x])))});
-app.get("/api/members",auth,allow("owner"),async(req,res)=>{const r=await q("SELECT id,name,email,role,display_title AS \"displayTitle\",active,finance_entry_only AS \"financeEntryOnly\",finance_access AS \"financeAccess\",finance_edit AS \"financeEdit\",showroom_access AS \"showroomAccess\",showroom_edit AS \"showroomEdit\",scout_access AS \"scoutAccess\",inventory_access AS \"inventoryAccess\",inventory_edit AS \"inventoryEdit\",inventory_prices AS \"inventoryPrices\",inventory_scope AS \"inventoryScope\",inventory_manage AS \"inventoryManage\",reception_access AS \"receptionAccess\",reception_edit AS \"receptionEdit\" FROM users WHERE role<>'owner' AND active=true ORDER BY created_at");res.json(r.rows)});
+app.get("/api/members",auth,allow("owner"),async(req,res)=>{const r=await q("SELECT id,name,email,role,display_title AS \"displayTitle\",active,finance_entry_only AS \"financeEntryOnly\",finance_access AS \"financeAccess\",finance_edit AS \"financeEdit\",showroom_access AS \"showroomAccess\",showroom_edit AS \"showroomEdit\",scout_access AS \"scoutAccess\",inventory_access AS \"inventoryAccess\",inventory_edit AS \"inventoryEdit\",inventory_prices AS \"inventoryPrices\",inventory_scope AS \"inventoryScope\",inventory_manage AS \"inventoryManage\",reception_access AS \"receptionAccess\",reception_edit AS \"receptionEdit\",invoice_access AS \"invoiceAccess\",invoice_edit AS \"invoiceEdit\" FROM users WHERE role<>'owner' AND active=true ORDER BY created_at");res.json(r.rows)});
 app.post("/api/members",auth,allow("owner"),async(req,res)=>{
  const name=String(req.body.name||"").trim(),email=cleanEmail(req.body.email),role=req.body.role,password=String(req.body.password||"");
+ const invoiceAccess=req.body.invoiceAccess===true,invoiceEdit=invoiceAccess&&req.body.invoiceEdit===true;
  const receptionAccess=req.body.receptionAccess===true,receptionEdit=receptionAccess&&req.body.receptionEdit===true;
  const inventoryManage=req.body.inventoryManage===true,inventoryAccess=req.body.inventoryAccess===true||inventoryManage,inventoryEdit=inventoryAccess&&(req.body.inventoryEdit===true||inventoryManage),inventoryPrices=inventoryAccess&&(req.body.inventoryPrices===true||inventoryManage),inventoryScope=req.body.inventoryScope||"services";
  if(!["services","gallery","both"].includes(inventoryScope))return res.status(400).json({error:"انبار مجاز معتبر نیست"});
  const financeEntryOnly=req.body.financeEntryOnly===true,financeAccess=req.body.financeAccess===true||financeEntryOnly,financeEdit=financeAccess&&req.body.financeEdit===true,showroomAccess=req.body.showroomAccess===true,showroomEdit=showroomAccess&&req.body.showroomEdit===true,scoutAccess=req.body.scoutAccess===true,displayTitle=req.body.displayTitle;
- if(!name||!/^\S+@\S+\.\S+$/.test(email)||!["admin","viewer"].includes(role)||!["عضو","مدیر","کارمند"].includes(displayTitle)||password.length<8||!financeAccess&&!showroomAccess&&!scoutAccess&&!inventoryAccess&&!receptionAccess)return res.status(400).json({error:"نام، ایمیل، رمز حداقل ۸ حرف و یک بخش مجاز لازم است"});
+ if(!name||!/^\S+@\S+\.\S+$/.test(email)||!["admin","viewer"].includes(role)||!["عضو","مدیر","کارمند"].includes(displayTitle)||password.length<8||!financeAccess&&!showroomAccess&&!scoutAccess&&!inventoryAccess&&!receptionAccess&&!invoiceAccess)return res.status(400).json({error:"نام، ایمیل، رمز حداقل ۸ حرف و یک بخش مجاز لازم است"});
  const hash=await bcrypt.hash(password,12),id=crypto.randomUUID();
- try{await q("INSERT INTO users(id,name,email,password_hash,role,display_title,finance_access,finance_edit,showroom_access,showroom_edit,scout_access,finance_entry_only,inventory_access,inventory_edit,inventory_prices,inventory_scope,inventory_manage,reception_access,reception_edit) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)",[id,name,email,hash,role,displayTitle,financeAccess,financeEdit,showroomAccess,showroomEdit,scoutAccess,financeEntryOnly,inventoryAccess,inventoryEdit,inventoryPrices,inventoryScope,inventoryManage,receptionAccess,receptionEdit])}catch(e){if(e.code==="23505")return res.status(409).json({error:"این ایمیل قبلاً ثبت شده"});throw e}
- await audit(req.user,"add_member",email,{name,role,displayTitle,financeAccess,financeEdit,showroomAccess,showroomEdit,scoutAccess,financeEntryOnly,inventoryAccess,inventoryEdit,inventoryPrices,inventoryScope,inventoryManage,receptionAccess,receptionEdit});res.status(201).json({id});
+ try{await q("INSERT INTO users(id,name,email,password_hash,role,display_title,finance_access,finance_edit,showroom_access,showroom_edit,scout_access,finance_entry_only,inventory_access,inventory_edit,inventory_prices,inventory_scope,inventory_manage,reception_access,reception_edit,invoice_access,invoice_edit) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)",[id,name,email,hash,role,displayTitle,financeAccess,financeEdit,showroomAccess,showroomEdit,scoutAccess,financeEntryOnly,inventoryAccess,inventoryEdit,inventoryPrices,inventoryScope,inventoryManage,receptionAccess,receptionEdit,invoiceAccess,invoiceEdit])}catch(e){if(e.code==="23505")return res.status(409).json({error:"این ایمیل قبلاً ثبت شده"});throw e}
+ await audit(req.user,"add_member",email,{name,role,displayTitle,financeAccess,financeEdit,showroomAccess,showroomEdit,scoutAccess,financeEntryOnly,inventoryAccess,inventoryEdit,inventoryPrices,inventoryScope,inventoryManage,receptionAccess,receptionEdit,invoiceAccess,invoiceEdit});res.status(201).json({id});
 });
 app.put("/api/members/:id",auth,allow("owner"),async(req,res)=>{
  const name=String(req.body.name||"").trim(),role=req.body.role,password=String(req.body.password||"");
+ const invoiceAccess=req.body.invoiceAccess===true,invoiceEdit=invoiceAccess&&req.body.invoiceEdit===true;
  const receptionAccess=req.body.receptionAccess===true,receptionEdit=receptionAccess&&req.body.receptionEdit===true;
  const inventoryManage=req.body.inventoryManage===true,inventoryAccess=req.body.inventoryAccess===true||inventoryManage,inventoryEdit=inventoryAccess&&(req.body.inventoryEdit===true||inventoryManage),inventoryPrices=inventoryAccess&&(req.body.inventoryPrices===true||inventoryManage),inventoryScope=req.body.inventoryScope||"services";
  if(!["services","gallery","both"].includes(inventoryScope))return res.status(400).json({error:"انبار مجاز معتبر نیست"});
  const financeEntryOnly=req.body.financeEntryOnly===true,financeAccess=req.body.financeAccess===true||financeEntryOnly,financeEdit=financeAccess&&req.body.financeEdit===true,showroomAccess=req.body.showroomAccess===true,showroomEdit=showroomAccess&&req.body.showroomEdit===true,scoutAccess=req.body.scoutAccess===true,displayTitle=req.body.displayTitle;
- if(!name||!["admin","viewer"].includes(role)||!["عضو","مدیر","کارمند"].includes(displayTitle)||!financeAccess&&!showroomAccess&&!scoutAccess&&!inventoryAccess&&!receptionAccess)return res.status(400).json({error:"نام و دسترسی به حداقل یک بخش لازم است"});
+ if(!name||!["admin","viewer"].includes(role)||!["عضو","مدیر","کارمند"].includes(displayTitle)||!financeAccess&&!showroomAccess&&!scoutAccess&&!inventoryAccess&&!receptionAccess&&!invoiceAccess)return res.status(400).json({error:"نام و دسترسی به حداقل یک بخش لازم است"});
  if(password&&password.length<8)return res.status(400).json({error:"رمز باید حداقل ۸ حرف باشد"});
- const r=await q("UPDATE users SET name=$1,role=$2,display_title=$3,finance_access=$4,finance_edit=$5,showroom_access=$6,showroom_edit=$7,scout_access=$8,finance_entry_only=$9,password_hash=COALESCE($10,password_hash),inventory_access=$11,inventory_edit=$12,inventory_prices=$13,inventory_scope=$14,inventory_manage=$15,reception_access=$16,reception_edit=$17,updated_at=NOW() WHERE id=$18 AND role<>'owner' RETURNING id",[name,role,displayTitle,financeAccess,financeEdit,showroomAccess,showroomEdit,scoutAccess,financeEntryOnly,password?await bcrypt.hash(password,12):null,inventoryAccess,inventoryEdit,inventoryPrices,inventoryScope,inventoryManage,receptionAccess,receptionEdit,req.params.id]);
+ const r=await q("UPDATE users SET name=$1,role=$2,display_title=$3,finance_access=$4,finance_edit=$5,showroom_access=$6,showroom_edit=$7,scout_access=$8,finance_entry_only=$9,password_hash=COALESCE($10,password_hash),inventory_access=$11,inventory_edit=$12,inventory_prices=$13,inventory_scope=$14,inventory_manage=$15,reception_access=$16,reception_edit=$17,invoice_access=$18,invoice_edit=$19,updated_at=NOW() WHERE id=$20 AND role<>'owner' RETURNING id",[name,role,displayTitle,financeAccess,financeEdit,showroomAccess,showroomEdit,scoutAccess,financeEntryOnly,password?await bcrypt.hash(password,12):null,inventoryAccess,inventoryEdit,inventoryPrices,inventoryScope,inventoryManage,receptionAccess,receptionEdit,invoiceAccess,invoiceEdit,req.params.id]);
  if(!r.rowCount)return res.status(404).json({error:"عضو پیدا نشد"});
- await audit(req.user,"update_member",req.params.id,{name,role,displayTitle,financeAccess,financeEdit,showroomAccess,showroomEdit,scoutAccess,financeEntryOnly,inventoryAccess,inventoryEdit,inventoryPrices,inventoryScope,inventoryManage,receptionAccess,receptionEdit});res.json({ok:true});
+ await audit(req.user,"update_member",req.params.id,{name,role,displayTitle,financeAccess,financeEdit,showroomAccess,showroomEdit,scoutAccess,financeEntryOnly,inventoryAccess,inventoryEdit,inventoryPrices,inventoryScope,inventoryManage,receptionAccess,receptionEdit,invoiceAccess,invoiceEdit});res.json({ok:true});
 });
 app.delete("/api/members/:id",auth,allow("owner"),async(req,res)=>{await q("UPDATE users SET active=false,updated_at=NOW() WHERE id=$1 AND role<>'owner'",[req.params.id]);await audit(req.user,"disable_member",req.params.id);res.json({ok:true})});
 app.post("/api/import",auth,allow("owner"),async(req,res)=>{
@@ -658,8 +666,9 @@ app.put("/api/showroom/deals/:id",showroomWrite,async(req,res)=>{
 });
 installInventory(app,{q,pool,auth,periodOf,currentPeriod});
 installReception(app,{q,pool,auth});
+installInvoices(app,{q,pool,auth,periodOf,currentPeriod});
 // Serve only browser assets. Never expose server source, archives or local files.
-for(const asset of ["index.html","agency.html","app.js","showroom.js","scout.js","inventory.js","inventory.css","reception.js","reception.css"]){
+for(const asset of ["index.html","agency.html","app.js","showroom.js","scout.js","inventory.js","inventory.css","reception.js","reception.css","invoice.js","invoice.css"]){
  app.get("/"+asset,(req,res)=>res.sendFile(path.join(__dirname,asset)));
 }
 app.get("*",(req,res)=>res.sendFile(path.join(__dirname,"index.html")));

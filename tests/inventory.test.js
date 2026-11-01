@@ -38,3 +38,37 @@ test('delegated manager has owner inventory powers within the granted warehouse 
  await ok('/transfers',{itemId:fresh,destination:'gallery',quantity:1,reason:'Delegated transfer'},'manager');
  const s=await ok('/',null,'manager');assert.equal(s.prices,true);assert.equal(s.items.find(i=>i.id===fresh).quantity,2);
 });
+
+test('delete and restore empty items preserve history, finance links and audit trail',async()=>{
+ const fresh=(await ok('/items',{name:'Retired item',sku:'DEL-1',category:'مواد مصرفی',unit:'عدد',packSize:1,minStock:1})).id;
+ const purchase=await ok('/movements',{itemId:fresh,type:'in',quantity:2,totalCost:20,paidAmount:20,payment:'create',party:'Supplier'});
+ assert.equal((await request('/items/'+fresh,{},'owner','DELETE')).status,409);
+ await ok('/movements',{itemId:fresh,type:'consume',quantity:2,reason:'Used up',party:'Tech'});
+ const payload={requestId:id()};
+ assert.equal((await request('/items/'+fresh,payload,'viewer','DELETE')).status,403);
+ assert.equal((await request('/items/'+fresh,payload,'staff','DELETE')).status,403);
+ const deleted=await ok('/items/'+fresh,payload,'owner','DELETE');assert.equal(deleted.active,false);
+ assert.equal((await ok('/items/'+fresh,payload,'owner','DELETE')).replayed,true);
+ let state=await ok('/');assert.equal(state.items.find(i=>i.id===fresh).active,false);
+ assert.equal(state.moves.filter(m=>m.item_id===fresh).length,2);
+ assert.equal((await q('SELECT id FROM transactions WHERE id=$1',[purchase.transactionId])).rowCount,1);
+ assert.equal((await request('/movements',{itemId:fresh,type:'in',quantity:1,totalCost:10,party:'Supplier'})).status,404);
+ assert.equal((await request('/items/'+fresh+'/restore',{},'staff')).status,403);
+ assert.equal((await request('/items/'+fresh+'/restore',{scope:'gallery'})).status,404);
+ assert.equal((await request('/items/not-an-id/restore',{})).status,400);
+ await ok('/items/'+fresh+'/restore',{});
+ state=await ok('/');assert.equal(state.items.find(i=>i.id===fresh).active,true);
+ assert.equal((await q('SELECT COUNT(*)::int AS n FROM audit_log WHERE action=$1',['inventory_/items/'+fresh])).rows[0].n,1);
+ await ok('/movements',{itemId:fresh,type:'in',quantity:1,totalCost:10,party:'Supplier'});
+});
+test('deletion respects warehouse management grants and outstanding loans',async()=>{
+ users.deleteManager={...users.staff,inventory_manage:true};
+ const fresh=(await ok('/items',{name:'Delegated deletion',sku:'DEL-MGR',category:'سایر',unit:'عدد',packSize:1,minStock:0})).id;
+ assert.equal((await request('/items/'+fresh,{scope:'gallery'},'deleteManager','DELETE')).status,403);
+ await ok('/items/'+fresh,{},'deleteManager','DELETE');await ok('/items/'+fresh+'/restore',{},'deleteManager');
+ const tool=(await ok('/items',{name:'Loaned tool',sku:'DEL-TOOL',category:'ابزار و تجهیزات',unit:'عدد',packSize:1,minStock:0,opening:1,unitCost:10})).id;
+ const loan=(await ok('/loans',{itemId:tool,quantity:1,person:'Tech'})).id;
+ const blocked=await request('/items/'+tool,{},'owner','DELETE');assert.equal(blocked.status,409);assert.match(blocked.data.error,/امانی/);
+ await ok('/loans/'+loan+'/return',{});await ok('/counts',{itemId:tool,actual:0,reason:'Retired tool'});
+ await ok('/items/'+tool,{},'owner','DELETE');
+});

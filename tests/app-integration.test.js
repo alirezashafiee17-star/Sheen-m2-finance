@@ -43,6 +43,17 @@ test('full app: migration, login, inventory-only member, UI forms, and linked fi
   assert.equal((await call('/transactions/'+own[10],null,limited,'DELETE')).status,403);
   await w.eval('loadAll()');assert.ok($('entryRecent').querySelector('[data-edit]'));assert.equal($('entryRecent').querySelector('[data-delete]'),null);
   $('entryRecent').querySelector('[data-edit]').click();assert.equal($('modal').open,true);$('desc').value='UI recent edit';await w.eval('saveTransaction()');assert.ok($('entryRecent').textContent.includes('UI recent edit'));
+  // A changed limit applies to both the list and edits on existing signed-in accounts.
+  assert.equal((await call('/members/'+created.data.id,{...saved,financeRecentLimit:3},token,'PUT')).status,200);
+  assert.deepEqual((await call('/transactions/recent',null,limited)).data.map(r=>r.id),own.slice(-3).reverse());
+  assert.equal((await call('/transactions/'+own[7],edit,limited,'PUT')).status,403);
+  assert.equal((await call('/transactions/'+own[8],edit,limited,'PUT')).status,200);
+  assert.equal((await call('/members/'+created.data.id,{...saved,financeRecentLimit:0},token,'PUT')).status,200);
+  assert.deepEqual((await call('/transactions/recent',null,limited)).data,[]);
+  assert.equal((await call('/transactions/'+own[10],edit,limited,'PUT')).status,403);
+  assert.equal((await call('/transactions',{...edit,amount:15},limited)).status,201);
+  assert.equal((await call('/members/'+created.data.id,{...saved,financeRecentLimit:-1},token,'PUT')).status,400);
+  assert.equal((await call('/members/'+created.data.id,{...saved,financeRecentLimit:10},token,'PUT')).status,200);
   // Managers confirm deletion, can restore it, and cannot delete stocked items.
   $('inventoryModule').click();await w.loadInventory();w.document.querySelector('[data-ivtab="stock"]').click();
   $('ivAdd').click();form.elements.name.value='Disposable item';form.elements.sku.value='UI-DELETE';
@@ -74,8 +85,28 @@ test('full app: migration, login, inventory-only member, UI forms, and linked fi
   await rf.onsubmit({preventDefault(){},target:rf});assert.equal($('rcFormError').textContent,'');assert.equal($('receptionDetailModal').open,true);assert.ok($('rcDetail').textContent.includes('Test reception customer'));assert.equal($('rcDetail').querySelector('script'),null);
   assert.ok($('rcDetail').textContent.includes('۱۸:۳۰'));await $('rcAdvance').onclick();assert.ok($('rcDetail').textContent.includes('در حال انجام'));
   $('rcEdit').click();rf.elements.services.value='Corrected services';await rf.onsubmit({preventDefault(){},target:rf});assert.equal($('rcFormError').textContent,'');assert.ok($('rcDetail').textContent.includes('Corrected services'));
-  $('rcStatus').value='delivered';await $('rcStatusSave').onclick();assert.equal($('rcEdit'),null);assert.equal($('rcPhotoInput'),null);assert.ok($('rcDetail').textContent.includes('زمان تحویل واقعی'));
+  $('rcStatus').value='delivered';await $('rcStatusSave').onclick();assert.ok($('rcEdit'));assert.equal($('rcPhotoInput'),null);assert.ok($('rcDetail').textContent.includes('زمان تحویل واقعی'));
   assert.equal((await query('SELECT COUNT(*)::int AS n FROM transactions')).rows[0].n,beforeFinance.rows[0].n);assert.equal((await query('SELECT COUNT(*)::int AS n FROM inventory_moves')).rows[0].n,beforeMoves.rows[0].n);
+  // Simulate signing with a pointer on the white page and verify its saved snapshot.
+  const canvas=$('rcSignatureCanvas');
+  canvas.getContext=()=>({clearRect(){},beginPath(){},moveTo(){},lineTo(){},stroke(){}});
+  canvas.getBoundingClientRect=()=>({left:0,top:0,width:400,height:240});
+  canvas.setPointerCapture=()=>{};
+  $('rcSign').click();assert.equal($('rcSignatureModal').open,true);
+  await $('rcSignatureSave').onclick();assert.ok($('rcSignatureError').textContent);
+  canvas.onpointerdown({button:0,pointerId:1,clientX:60,clientY:60,preventDefault(){}});
+  canvas.onpointermove({pointerId:1,clientX:150,clientY:100});
+  canvas.onpointerup({pointerId:1});
+  await $('rcSignatureSave').onclick();assert.equal($('rcSignatureModal').open,false);
+  assert.ok($('rcDetail').querySelector('.rc-signature-image path'));
+  await $('rcDelete').onclick();assert.ok(!$('rcList').textContent.includes('Test reception customer'));
+  $('rcFilter').value='deleted';await w.loadReception();
+  await $('rcList').querySelector('[data-rc-detail]').onclick();assert.ok($('rcRestore'));assert.equal($('rcEdit'),null);
+  await $('rcRestore').onclick();$('rcFilter').value='';await w.loadReception();
+  await $('rcList').querySelector('[data-rc-detail]').onclick();
+  $('rcEdit').click();rf.elements.acceptedDate.value='۱۴۰۵/۰۸/۱۷';rf.elements.acceptedTime.value='۱۰:۳۰';
+  await rf.onsubmit({preventDefault(){},target:rf});assert.ok($('rcSign'));assert.equal($('rcDetail').querySelector('.rc-signature-image'),null);
+  assert.ok($('rcDetail').textContent.includes('۱۰:۳۰'));
   const receptionistToken=receptionistLogin.data.token,record=(await call('/reception',null,receptionistToken)).data.items[0];
   assert.equal((await call('/members/'+createdReceptionist.data.id,{...receptionist,receptionEdit:false},token,'PUT')).status,200);
   assert.equal((await call('/reception/'+record.id+'/status',{status:'working',version:record.version},receptionistToken,'PATCH')).status,403);
@@ -96,8 +127,11 @@ test('full app: migration, login, inventory-only member, UI forms, and linked fi
   $('logout').onclick();$('loginEmail').value='owner@example.invalid';$('loginPassword').value='Test-only-secret-123';await $('loginBtn').onclick();
   w.eval("openMember(members.find(m=>m.email==='invoice@example.invalid'))");assert.equal($('memberInvoice').checked,true);assert.equal($('memberInvoiceEdit').checked,true);assert.equal($('memberFinance').checked,false);await w.eval('saveMember()');
   w.openInvoicesForReception(record);await w.loadInvoices();assert.equal($('invoiceArea').hidden,false);assert.ok($('biSource').textContent.includes(record.customerName));await $('biNew').onclick();assert.equal(bf.elements.customerName.value,record.customerName);
-  $('biLines').querySelector('[data-line="unitPrice"]').value='1000';$('biAddRow').click();const goods=[...$('biLines').querySelectorAll('.bi-line')][1];goods.querySelector('[data-line="type"]').value='goods';goods.querySelector('[data-line="type"]').onchange();const stockItem=(await call('/inventory',null,token)).data.items.find(i=>i.sku==='TEST');goods.querySelector('[data-line="itemId"]').value=stockItem.id;goods.querySelector('[data-line="quantity"]').value='2';goods.querySelector('[data-line="unitPrice"]').value='200';bf.elements.draftPaid.value='500';
+  bf.elements.number.value='۸۵';bf.elements.invoiceDate.value='۱۴۰۵/۰۸/۱۷';
+  $('biLines').querySelector('[data-line="unitPrice"]').value='1000';$('biAddGoods').click();const goods=[...$('biLines').querySelectorAll('.bi-line')][1];assert.equal(goods.querySelector('[data-line="type"]'),null);const stockItem=(await call('/inventory',null,token)).data.items.find(i=>i.sku==='TEST');goods.querySelector('[data-line="itemId"]').value=stockItem.id;goods.querySelector('[data-line="quantity"]').value='2';goods.querySelector('[data-line="unitPrice"]').value='200';bf.elements.draftPaid.value='500';
   await bf.onsubmit({preventDefault(){},target:bf});assert.equal($('biFormError').textContent,'');assert.equal((await call('/inventory',null,token)).data.items.find(i=>i.id===stockItem.id).quantity,4);
+  assert.ok($('biDetailTitle').textContent.includes('۸۵'));
+  assert.ok($('biDetail').textContent.includes('۱۴۰۵/۰۸/۱۷'));
   await $('biIssue').onclick();assert.equal($('biDetailError').textContent,'');assert.equal((await call('/inventory',null,token)).data.items.find(i=>i.id===stockItem.id).quantity,2);
   await $('biEdit').onclick();[...$('biLines').querySelectorAll('.bi-line')][1].querySelector('[data-line="quantity"]').value='1';bf.elements.reason.value='One item returned';await bf.onsubmit({preventDefault(){},target:bf});assert.equal($('biFormError').textContent,'');assert.equal((await call('/inventory',null,token)).data.items.find(i=>i.id===stockItem.id).quantity,3);
   $('biPayment').click();assert.equal(bf.elements.amount.value,'700');await bf.onsubmit({preventDefault(){},target:bf});assert.equal($('biFormError').textContent,'');assert.equal($('biPayment'),null);

@@ -19,7 +19,7 @@ function showModule(module){
  $("#inventoryModule").className=module==="inventory"?"primary":"ghost";
  if(module==="inventory"&&window.loadInventory)window.loadInventory().catch(e=>toast(e.message));
  $("#financeModule").hidden=!currentUser.financeAccess;
- $("#financeModule").textContent=currentUser.financeEntryOnly?"۱۰ تراکنش آخر من":"مالی شین";
+ $("#financeModule").textContent=currentUser.financeEntryOnly?"ثبت تراکنش":"مالی شین";
  $("#showroomModule").hidden=!currentUser.showroomAccess;
  $("#scoutModule").hidden=!currentUser.scoutAccess;
  $("#financeArea").hidden=module!=="finance";

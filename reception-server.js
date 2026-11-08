@@ -11,9 +11,30 @@ function fields(b){
  if(!customerName||!/^\+?\d{8,15}$/.test(phone)||!model||!plate||!services)throw fail(400,'نام مشتری، شماره تماس معتبر، مدل، پلاک و خدمات درخواستی را وارد کنید');
  if(mileage!==null&&(!Number.isSafeInteger(mileage)||mileage<0||mileage>10000000))throw fail(400,'کیلومتر خودرو معتبر نیست');
  let dueAt=null;if(b.dueAt){const d=new Date(b.dueAt);if(Number.isNaN(d.getTime())||d.getUTCFullYear()<2000||d.getUTCFullYear()>2200)throw fail(400,'زمان تحویل معتبر نیست');dueAt=d.toISOString()}
- return {customerName,phone,model,plate,color:clean(b.color,60),mileage,services,condition:clean(b.condition,3000),dueAt};
+ let acceptedAt=null;
+ if(b.acceptedAt){
+  const accepted=new Date(b.acceptedAt);
+  if(Number.isNaN(accepted.getTime())||accepted.getUTCFullYear()<2000||accepted.getUTCFullYear()>2200)throw fail(400,'تاریخ پذیرش معتبر نیست');
+  acceptedAt=accepted.toISOString();
+ }
+ return {customerName,phone,model,plate,color:clean(b.color,60),mileage,services,condition:clean(b.condition,3000),dueAt,...(acceptedAt?{acceptedAt}:{})};
 }
-const columns=`id,number,customer_name AS "customerName",phone,model,plate,color,mileage,services,condition,due_at AS "dueAt",status,version,actor_name AS "actorName",created_at AS "createdAt",updated_at AS "updatedAt",delivered_at AS "deliveredAt"`;
+const columns=`id,number,customer_name AS "customerName",phone,model,plate,color,mileage,services,condition,due_at AS "dueAt",status,version,actor_name AS "actorName",created_at AS "createdAt",updated_at AS "updatedAt",delivered_at AS "deliveredAt",COALESCE(accepted_at,created_at) AS "acceptedAt",deleted_at AS "deletedAt"`;
+
+function signatureStrokes(strokes){
+ if(!Array.isArray(strokes)||!strokes.length||strokes.length>200)throw fail(400,'ابتدا مشتری روی صفحه امضا کند');
+ let points=0,hasInk=false;
+ for(const stroke of strokes){
+  if(!Array.isArray(stroke)||!stroke.length)throw fail(400,'امضا معتبر نیست');
+  for(const point of stroke){
+   if(!Array.isArray(point)||point.length!==2||!point.every(Number.isInteger)||point[0]<0||point[0]>1000||point[1]<0||point[1]>600)throw fail(400,'امضا معتبر نیست');
+   if(++points>10000)throw fail(400,'امضا طولانی است؛ صفحه را پاک کنید و دوباره امضا بگیرید');
+   if(point[0]!==stroke[0][0]||point[1]!==stroke[0][1])hasInk=true;
+  }
+ }
+ if(!hasInk)throw fail(400,'ابتدا مشتری روی صفحه امضا کند');
+ return strokes;
+}
 async function initReception(q){
  await q(`ALTER TABLE users ADD COLUMN IF NOT EXISTS reception_access BOOLEAN NOT NULL DEFAULT FALSE;
  ALTER TABLE users ADD COLUMN IF NOT EXISTS reception_edit BOOLEAN NOT NULL DEFAULT FALSE;
@@ -24,6 +45,13 @@ async function initReception(q){
  status TEXT NOT NULL DEFAULT 'received' CHECK(status IN ('received','working','ready','delivered')),
  version INTEGER NOT NULL DEFAULT 1,created_by UUID NOT NULL REFERENCES users(id),actor_name TEXT NOT NULL,
  create_hash TEXT NOT NULL,created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),delivered_at TIMESTAMPTZ);
+ ALTER TABLE reception_records ADD COLUMN IF NOT EXISTS accepted_at TIMESTAMPTZ;
+ ALTER TABLE reception_records ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
+ CREATE TABLE IF NOT EXISTS reception_signatures(
+ id UUID PRIMARY KEY,reception_id UUID NOT NULL REFERENCES reception_records(id),strokes JSONB NOT NULL,
+ snapshot JSONB NOT NULL,signed_by UUID NOT NULL REFERENCES users(id),signed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+ invalidated_at TIMESTAMPTZ);
+ CREATE UNIQUE INDEX IF NOT EXISTS reception_active_signature ON reception_signatures(reception_id) WHERE invalidated_at IS NULL;
  CREATE INDEX IF NOT EXISTS reception_records_status ON reception_records(status,number DESC);
  CREATE TABLE IF NOT EXISTS reception_events(
  id UUID PRIMARY KEY,reception_id UUID NOT NULL REFERENCES reception_records(id),actor_name TEXT NOT NULL,
@@ -41,17 +69,17 @@ function installReception(app,{q,pool,auth}){
  const write=(req,res,next)=>req.user.role==='owner'||req.user.reception_edit?next():res.status(403).json({error:'اجازه ثبت و ویرایش پذیرش ندارید'});
  const wrap=fn=>async(req,res)=>{try{res.set('Cache-Control','private, no-store');await fn(req,res)}catch(e){if(!e.status)console.error('Reception request failed',e.code||e.message);res.status(e.status||500).json({error:e.status?e.message:'اطلاعات پذیرش ذخیره نشد؛ دوباره تلاش کنید'})}};
  async function tx(fn){const c=await pool.connect();try{await c.query('BEGIN');const result=await fn(c);await c.query('COMMIT');return result}catch(e){await c.query('ROLLBACK').catch(()=>{});throw e}finally{c.release()}}
- async function record(c,id,lock=false){if(!uuid(id))throw fail(400,'شماره پذیرش معتبر نیست');const r=await c.query(`SELECT ${columns} FROM reception_records WHERE id=$1${lock?' FOR UPDATE':''}`,[id]);if(!r.rowCount)throw fail(404,'پذیرش پیدا نشد');return r.rows[0]}
+ async function record(c,id,lock=false,includeDeleted=false,includeSignature=false){if(!uuid(id))throw fail(400,'شماره پذیرش معتبر نیست');const r=await c.query(`SELECT ${columns}${includeSignature?",(SELECT jsonb_build_object('strokes',strokes,'signedAt',signed_at) FROM reception_signatures WHERE reception_id=reception_records.id AND invalidated_at IS NULL) AS signature":''} FROM reception_records WHERE id=$1${includeDeleted?'':' AND deleted_at IS NULL'}${lock?' FOR UPDATE':''}`,[id]);if(!r.rowCount)throw fail(404,'پذیرش پیدا نشد');return r.rows[0]}
  async function event(c,req,id,action,from=null,to=null){await c.query('INSERT INTO reception_events(id,reception_id,actor_name,action,from_status,to_status) VALUES($1,$2,$3,$4,$5,$6)',[crypto.randomUUID(),id,req.user.name,action,from,to]);await c.query('INSERT INTO audit_log(id,action,target,data,actor_id) VALUES($1,$2,$3,$4,$5)',[crypto.randomUUID(),'reception_'+action,id,JSON.stringify({from,to}),req.user.sub])}
  router.get('/',wrap(async(req,res)=>{
   const page=Number(req.query.page||0),status=String(req.query.status||''),search=clean(digits(req.query.q),120).replace(/[يى]/g,'ی').replace(/ك/g,'ک');
-  if(!Number.isSafeInteger(page)||page<0||page>100000||status&&!statuses.includes(status))throw fail(400,'فیلتر پذیرش معتبر نیست');
-  const where=`($1='' OR status=$1) AND ($2='' OR strpos(translate(lower(replace(replace(replace(customer_name||' '||phone||' '||model||' '||plate||' '||number::text,'ي','ی'),'ى','ی'),'ك','ک')),'۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩','01234567890123456789'),lower($2))>0)`;
-  const [rows,total,counts]=await Promise.all([q(`SELECT ${columns},(SELECT COUNT(*)::int FROM reception_photos p WHERE p.reception_id=reception_records.id) AS "photoCount" FROM reception_records WHERE ${where} ORDER BY number DESC LIMIT 30 OFFSET $3`,[status,search,page*30]),q(`SELECT COUNT(*)::int AS count FROM reception_records WHERE ${where}`,[status,search]),q('SELECT status,COUNT(*)::int AS count FROM reception_records GROUP BY status')]);
+  if(!Number.isSafeInteger(page)||page<0||page>100000||status&&status!=='deleted'&&!statuses.includes(status))throw fail(400,'فیلتر پذیرش معتبر نیست');
+  const where=`(($1='deleted' AND deleted_at IS NOT NULL) OR (deleted_at IS NULL AND ($1='' OR status=$1))) AND ($2='' OR strpos(translate(lower(replace(replace(replace(customer_name||' '||phone||' '||model||' '||plate||' '||number::text,'ي','ی'),'ى','ی'),'ك','ک')),'۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩','01234567890123456789'),lower($2))>0)`;
+  const [rows,total,counts]=await Promise.all([q(`SELECT ${columns},(SELECT COUNT(*)::int FROM reception_photos p WHERE p.reception_id=reception_records.id) AS "photoCount" FROM reception_records WHERE ${where} ORDER BY number DESC LIMIT 30 OFFSET $3`,[status,search,page*30]),q(`SELECT COUNT(*)::int AS count FROM reception_records WHERE ${where}`,[status,search]),q('SELECT status,COUNT(*)::int AS count FROM reception_records WHERE deleted_at IS NULL GROUP BY status')]);
   res.json({items:rows.rows.map(r=>({...r,number:Number(r.number)})),total:total.rows[0].count,page,counts:Object.fromEntries(counts.rows.map(x=>[x.status,x.count]))});
  }));
  router.get('/:id',wrap(async(req,res)=>{
-  const r=await record({query:q},req.params.id);
+  const r=await record({query:q},req.params.id,false,true,true);
   const [photos,events]=await Promise.all([q('SELECT id,mime FROM reception_photos WHERE reception_id=$1 ORDER BY created_at,id',[r.id]),q('SELECT actor_name AS "actorName",action,from_status AS "fromStatus",to_status AS "toStatus",created_at AS "createdAt" FROM reception_events WHERE reception_id=$1 ORDER BY created_at,id',[r.id])]);
   res.json({...r,number:Number(r.number),photos:photos.rows,events:events.rows});
  }));
@@ -62,16 +90,58 @@ function installReception(app,{q,pool,auth}){
    await c.query('SELECT pg_advisory_xact_lock(hashtext($1))',[id]);
    const old=await c.query('SELECT id,number,created_by,create_hash FROM reception_records WHERE id=$1',[id]);
    if(old.rowCount){if(old.rows[0].created_by!==req.user.sub||old.rows[0].create_hash!==hash)throw fail(409,'این فرم قبلاً ثبت شده؛ فهرست پذیرش را بروزرسانی کنید');return {id,number:Number(old.rows[0].number),replayed:true}}
-   const r=await c.query(`INSERT INTO reception_records(id,customer_name,phone,model,plate,color,mileage,services,condition,due_at,created_by,actor_name,create_hash) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING number`,[id,f.customerName,f.phone,f.model,f.plate,f.color,f.mileage,f.services,f.condition,f.dueAt,req.user.sub,req.user.name,hash]);
+   const r=await c.query(`INSERT INTO reception_records(id,customer_name,phone,model,plate,color,mileage,services,condition,due_at,created_by,actor_name,create_hash,accepted_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) RETURNING number`,[id,f.customerName,f.phone,f.model,f.plate,f.color,f.mileage,f.services,f.condition,f.dueAt,req.user.sub,req.user.name,hash,f.acceptedAt||null]);
    await event(c,req,id,'created',null,'received');return {id,number:Number(r.rows[0].number)};
   });res.status(result.replayed?200:201).json(result);
  }));
  router.put('/:id',write,wrap(async(req,res)=>{
   const f=fields(req.body);
   res.json(await tx(async c=>{const old=await record(c,req.params.id,true);if(req.body.version!==old.version)throw fail(409,'این پذیرش تغییر کرده؛ آن را دوباره باز کنید');
-   if(old.status==='delivered')throw fail(409,'برای ویرایش پذیرش تحویل‌شده، ابتدا وضعیت آن را برگردانید');
-   await c.query('UPDATE reception_records SET customer_name=$1,phone=$2,model=$3,plate=$4,color=$5,mileage=$6,services=$7,condition=$8,due_at=$9,version=version+1,updated_at=NOW() WHERE id=$10',[f.customerName,f.phone,f.model,f.plate,f.color,f.mileage,f.services,f.condition,f.dueAt,old.id]);
+   await c.query('UPDATE reception_records SET customer_name=$1,phone=$2,model=$3,plate=$4,color=$5,mileage=$6,services=$7,condition=$8,due_at=$9,accepted_at=COALESCE($10,accepted_at),version=version+1,updated_at=NOW() WHERE id=$11',[f.customerName,f.phone,f.model,f.plate,f.color,f.mileage,f.services,f.condition,f.dueAt,f.acceptedAt||null,old.id]);
+   const invalidated=await c.query('UPDATE reception_signatures SET invalidated_at=NOW() WHERE reception_id=$1 AND invalidated_at IS NULL',[old.id]);
+   if(invalidated.rowCount)await event(c,req,old.id,'signature_invalidated');
    await event(c,req,old.id,'edited');return {id:old.id,version:old.version+1};
+  }));
+ }));
+ router.delete('/:id',write,wrap(async(req,res)=>{
+  res.json(await tx(async c=>{
+   const old=await record(c,req.params.id,true,true);
+   if(old.deletedAt)return {id:old.id,version:old.version};
+   if(req.body?.version!==old.version)throw fail(409,'پذیرش تغییر کرده؛ دوباره آن را باز کنید');
+   await c.query('UPDATE reception_records SET deleted_at=NOW(),version=version+1,updated_at=NOW() WHERE id=$1',[old.id]);
+   await event(c,req,old.id,'deleted');
+   return {id:old.id,version:old.version+1};
+  }));
+ }));
+ router.post('/:id/restore',write,wrap(async(req,res)=>{
+  res.json(await tx(async c=>{
+   const old=await record(c,req.params.id,true,true);
+   if(!old.deletedAt)return {id:old.id,version:old.version};
+   if(req.body?.version!==old.version)throw fail(409,'پذیرش تغییر کرده؛ دوباره آن را باز کنید');
+   await c.query('UPDATE reception_records SET deleted_at=NULL,version=version+1,updated_at=NOW() WHERE id=$1',[old.id]);
+   await event(c,req,old.id,'restored');
+   return {id:old.id,version:old.version+1};
+  }));
+ }));
+ router.put('/:id/signature',write,wrap(async(req,res)=>{
+  const {id,version}=req.body;
+  if(!uuid(id))throw fail(400,'فرم امضا را دوباره باز کنید');
+  const strokes=signatureStrokes(req.body.strokes);
+  res.json(await tx(async c=>{
+   const r=await record(c,req.params.id,true);
+   const previous=await c.query('SELECT reception_id,strokes,signed_by FROM reception_signatures WHERE id=$1',[id]);
+   if(previous.rowCount){
+    const old=previous.rows[0];
+    if(old.reception_id!==r.id||old.signed_by!==req.user.sub||JSON.stringify(old.strokes)!==JSON.stringify(strokes))throw fail(409,'این شناسه امضا قبلاً استفاده شده است');
+    return {id:r.id,version:r.version,replayed:true};
+   }
+   if(version!==r.version)throw fail(409,'پذیرش تغییر کرده؛ پرونده را دوباره باز کنید');
+   const active=await c.query('SELECT id FROM reception_signatures WHERE reception_id=$1 AND invalidated_at IS NULL',[r.id]);
+   if(active.rowCount)throw fail(409,'امضای این نسخه قبلاً ثبت شده است');
+   await c.query('INSERT INTO reception_signatures(id,reception_id,strokes,snapshot,signed_by) VALUES($1,$2,$3,$4,$5)',[id,r.id,JSON.stringify(strokes),JSON.stringify(r),req.user.sub]);
+   await c.query('UPDATE reception_records SET version=version+1,updated_at=NOW() WHERE id=$1',[r.id]);
+   await event(c,req,r.id,'signed');
+   return {id:r.id,version:r.version+1};
   }));
  }));
  router.patch('/:id/status',write,wrap(async(req,res)=>{

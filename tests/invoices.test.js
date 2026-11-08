@@ -57,3 +57,22 @@ test('additional payments enforce the outstanding balance, closed periods and ed
  assert.equal((await request('/'+billId+'/payments',{version:r.version,amount:1})).status,400);
  assert.equal((await request('/'+billId,{...r,discount:r.subtotal,draftPaid:r.paid,reason:'invalid'},'owner','PUT')).status,400);
 });
+
+test('editable draft numbers remain unique and invoice dates stay separate from payment dates',async()=>{
+ const invoiceDate='2026-10-31T08:30:00.000Z';
+ const first=await ok('',draft({number:'۹۰۰',invoiceDate}));
+ assert.equal(first.number,900);
+ assert.equal((await ok('/'+first.id)).invoiceDate,invoiceDate);
+ assert.equal((await request('',draft({number:900}))).status,409);
+ const automatic=await ok('',draft());
+ assert.equal(automatic.number,901);
+ const old=await ok('/'+first.id);
+ assert.equal((await request('/'+first.id,{...old,number:901},'owner','PUT')).status,409);
+ await ok('/'+first.id,{...old,number:'۹۰۲'},'owner','PUT');
+ await ok('/'+first.id+'/issue',{version:2});
+ const issued=await ok('/'+first.id);
+ assert.equal(issued.number,902);
+ assert.equal(issued.invoiceDate,invoiceDate);
+ assert.notEqual(issued.issuedAt,invoiceDate);
+ assert.equal((await request('/'+first.id,{...issued,number:903,reason:'renumber'},'owner','PUT')).status,409);
+});

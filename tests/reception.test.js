@@ -30,7 +30,7 @@ test('automatic numbers, idempotent creation and searchable paginated lists',asy
  assert.equal((await request('?page=-1')).status,400);assert.equal((await request('?status=bad')).status,400);
  assert.equal((await request('/'+recordId)).cache,'private, no-store');
 });
-test('versioned editing and status history protect delivered records and stale updates',async()=>{
+test('versioned editing preserves delivery status and rejects stale updates',async()=>{
  assert.equal((await request('/'+recordId,{...sample,version:1},'viewer','PUT')).status,403);
  await ok('/'+recordId,{...sample,services:'ویرایش خدمات',version:1},'editor','PUT');
  assert.equal((await request('/'+recordId,{...sample,version:1},'editor','PUT')).status,409);
@@ -39,9 +39,11 @@ test('versioned editing and status history protect delivered records and stale u
  assert.equal((await request('/'+recordId+'/status',{status:'bad',version:4},'editor','PATCH')).status,400);
  await ok('/'+recordId+'/status',{status:'delivered',version:4},'editor','PATCH');
  let r=await ok('/'+recordId);assert.ok(r.deliveredAt);assert.equal(r.events.filter(e=>e.action==='status').length,3);
- assert.equal((await request('/'+recordId,{...sample,version:5},'editor','PUT')).status,409);
- await ok('/'+recordId+'/status',{status:'working',version:5},'owner','PATCH');r=await ok('/'+recordId);assert.equal(r.deliveredAt,null);assert.equal(r.version,6);
- assert.equal((await q("SELECT COUNT(*)::int AS n FROM audit_log WHERE target=$1",[recordId])).rows[0].n,6);
+ const acceptedAt='2026-11-01T09:30:00+03:30';
+ await ok('/'+recordId,{...sample,acceptedAt,version:5},'editor','PUT');
+ r=await ok('/'+recordId);assert.equal(r.status,'delivered');assert.ok(r.deliveredAt);assert.equal(r.acceptedAt,new Date(acceptedAt).toISOString());
+ await ok('/'+recordId+'/status',{status:'working',version:6},'owner','PATCH');r=await ok('/'+recordId);assert.equal(r.deliveredAt,null);assert.equal(r.version,7);
+ assert.equal((await q("SELECT COUNT(*)::int AS n FROM audit_log WHERE target=$1",[recordId])).rows[0].n,7);
 });
 test('authenticated photos validate file data, deduplicate retries and enforce the five-photo limit',async()=>{
  const png=Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a4wAAAABJRU5ErkJggg==','base64');
@@ -58,6 +60,6 @@ test('authenticated photos validate file data, deduplicate retries and enforce t
  for(let i=0;i<4;i++)await ok('/'+recordId+'/photos',{...photo,id:id(),data:Buffer.concat([png,Buffer.from([i])]).toString('base64')},'editor');
  assert.equal((await ok('/'+recordId)).photos.length,5);
  assert.equal((await request('/'+recordId+'/photos',{...photo,id:id(),data:Buffer.concat([png,Buffer.from([9])]).toString('base64')},'editor')).status,409);
- await ok('/'+recordId+'/status',{status:'delivered',version:6},'editor','PATCH');
+ await ok('/'+recordId+'/status',{status:'delivered',version:7},'editor','PATCH');
  assert.equal((await request('/'+recordId+'/photos',photo,'editor')).status,409);
 });

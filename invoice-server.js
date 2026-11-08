@@ -22,6 +22,7 @@ async function initInvoices(q){await q(`
  notes TEXT NOT NULL DEFAULT '',status TEXT NOT NULL DEFAULT 'draft' CHECK(status IN ('draft','issued')),
  version INTEGER NOT NULL DEFAULT 1,created_by UUID NOT NULL REFERENCES users(id),actor_name TEXT NOT NULL,
  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),issued_at TIMESTAMPTZ);
+ ALTER TABLE invoices ADD COLUMN IF NOT EXISTS invoice_date TIMESTAMPTZ;
  CREATE INDEX IF NOT EXISTS invoices_reception ON invoices(reception_id);
  CREATE TABLE IF NOT EXISTS invoice_stock(invoice_id UUID NOT NULL REFERENCES invoices(id),item_id UUID NOT NULL REFERENCES inventory_items(id),quantity NUMERIC(18,3) NOT NULL,value_amount BIGINT NOT NULL,PRIMARY KEY(invoice_id,item_id));
  CREATE TABLE IF NOT EXISTS invoice_payments(id UUID PRIMARY KEY,invoice_id UUID NOT NULL REFERENCES invoices(id),transaction_id UUID NOT NULL UNIQUE REFERENCES transactions(id),amount BIGINT NOT NULL CHECK(amount>0),actor_name TEXT NOT NULL,created_at TIMESTAMPTZ NOT NULL DEFAULT NOW());
@@ -29,7 +30,7 @@ async function initInvoices(q){await q(`
  CREATE TABLE IF NOT EXISTS invoice_requests(id UUID PRIMARY KEY,actor_id UUID NOT NULL REFERENCES users(id),payload_hash TEXT NOT NULL,result JSONB NOT NULL);
  ALTER TABLE inventory_moves ADD COLUMN IF NOT EXISTS invoice_id UUID REFERENCES invoices(id);
  CREATE INDEX IF NOT EXISTS inventory_moves_invoice ON inventory_moves(invoice_id);`)}
-const publicInvoice=r=>{const {customer_name,reception_id,draft_paid,actor_name,created_at,updated_at,issued_at,...rest}=r;return {...rest,number:Number(r.number),subtotal:Number(r.subtotal),discount:Number(r.discount),total:Number(r.total),paid:Number(r.paid),remaining:Number(r.total)-Number(r.paid),customerName:customer_name,receptionId:reception_id,draftPaid:Number(draft_paid),actorName:actor_name,createdAt:created_at,updatedAt:updated_at,issuedAt:issued_at}};
+const publicInvoice=r=>{const {customer_name,reception_id,draft_paid,actor_name,created_at,updated_at,issued_at,invoice_date,...rest}=r;return {...rest,number:Number(r.number),subtotal:Number(r.subtotal),discount:Number(r.discount),total:Number(r.total),paid:Number(r.paid),remaining:Number(r.total)-Number(r.paid),customerName:customer_name,receptionId:reception_id,draftPaid:Number(draft_paid),actorName:actor_name,createdAt:created_at,updatedAt:updated_at,issuedAt:issued_at,invoiceDate:invoice_date||issued_at||created_at}};
 function installInvoices(app,{q,pool,auth,periodOf,currentPeriod}){
  const router=require('express').Router();router.use(auth);router.use((req,res,next)=>owner(req.user)||req.user.invoice_access?next():res.status(403).json({error:'به بخش فاکتورها دسترسی ندارید'}));
  const write=(req,res,next)=>owner(req.user)||req.user.invoice_edit?next():res.status(403).json({error:'اجازه ثبت و ویرایش فاکتور ندارید'});
@@ -40,8 +41,21 @@ function installInvoices(app,{q,pool,auth,periodOf,currentPeriod}){
  async function event(c,req,id,action,before,after,reason=''){await c.query('INSERT INTO invoice_events(id,invoice_id,action,reason,actor_name,before_data,after_data) VALUES($1,$2,$3,$4,$5,$6,$7)',[crypto.randomUUID(),id,action,text(reason,500),req.user.name,before?JSON.stringify(before):null,JSON.stringify(after)])}
  async function fields(c,req,existing=null){const b=req.body,customerName=text(b.customerName,120),phone=digits(text(b.phone,30));if(!customerName)throw fail(400,'نام مشتری لازم است');if(!Array.isArray(b.items)||!b.items.length||b.items.length>100)throw fail(400,'بین ۱ تا ۱۰۰ ردیف کالا یا خدمت ثبت کنید');const items=[];let subtotal=0;
   for(const row of b.items){const quantity=qty(row.quantity),unitPrice=money(row.unitPrice);if(!['service','goods'].includes(row.type)||quantity===null||unitPrice===null)throw fail(400,'نوع ردیف، مقدار و قیمت واحد معتبر لازم است');let title=text(row.title,150),unit=text(row.unit,30)||'مورد',itemId=null;if(row.type==='goods'){if(!inventoryAccess(req.user))throw fail(403,'برای انتخاب کالا به انبار خدمات دسترسی لازم است');if(!uuid(row.itemId))throw fail(400,'کالای انبار را انتخاب کنید');const r=await c.query("SELECT id,name,unit FROM inventory_items WHERE id=$1 AND scope='services' AND active=true",[row.itemId]);if(!r.rowCount)throw fail(400,'کالای فعال در انبار خدمات پیدا نشد');title=r.rows[0].name;unit=r.rows[0].unit;itemId=r.rows[0].id}if(!title)throw fail(400,'شرح خدمت را وارد کنید');const amount=Math.round(quantity*unitPrice);if(money(amount)===null||money(subtotal+amount)===null)throw fail(400,'مبلغ فاکتور از حد مجاز بیشتر است');subtotal+=amount;items.push({type:row.type,title,unit,itemId,quantity,unitPrice,amount})}
-  const discount=money(b.discount??0),draftPaid=money(b.draftPaid??0);if(discount===null||discount>subtotal||draftPaid===null||draftPaid>subtotal-discount)throw fail(400,'تخفیف یا مبلغ دریافتی از جمع فاکتور بیشتر است');let receptionId=b.receptionId||null;if(receptionId&&receptionId!==existing?.reception_id){if(!owner(req.user)&&!req.user.reception_access)throw fail(403,'به پذیرش خودرو دسترسی ندارید');if(!uuid(receptionId)||(await c.query('SELECT id FROM reception_records WHERE id=$1',[receptionId])).rowCount===0)throw fail(400,'پذیرش معتبر نیست')}
-  return {customerName,phone,model:text(b.model,120),plate:digits(text(b.plate,30)),receptionId,items,subtotal,discount,total:subtotal-discount,draftPaid,notes:text(b.notes,2000)};
+  const discount=money(b.discount??0),draftPaid=money(b.draftPaid??0);if(discount===null||discount>subtotal||draftPaid===null||draftPaid>subtotal-discount)throw fail(400,'تخفیف یا مبلغ دریافتی از جمع فاکتور بیشتر است');let receptionId=b.receptionId||null;if(receptionId&&receptionId!==existing?.reception_id){if(!owner(req.user)&&!req.user.reception_access)throw fail(403,'به پذیرش خودرو دسترسی ندارید');if(!uuid(receptionId)||(await c.query('SELECT id FROM reception_records WHERE id=$1 AND deleted_at IS NULL',[receptionId])).rowCount===0)throw fail(400,'پذیرش معتبر نیست')}
+  let invoiceDate=existing?.invoice_date||existing?.issued_at||existing?.created_at||new Date();
+  if(b.invoiceDate!==undefined){
+   const date=new Date(b.invoiceDate);
+   if(typeof b.invoiceDate!=='string'||!b.invoiceDate||Number.isNaN(date.getTime())||date.getUTCFullYear()<2000||date.getUTCFullYear()>2200)throw fail(400,'تاریخ فاکتور معتبر نیست');
+   invoiceDate=date;
+  }
+  let number=existing?Number(existing.number):null;
+  if(b.number!==undefined&&String(b.number).trim()!==''){
+   const input=digits(b.number).trim();
+   if(!/^\d{1,12}$/.test(input)||Number(input)<1)throw fail(400,'شماره فاکتور باید عدد صحیح و مثبت باشد');
+   number=Number(input);
+  }
+  if(existing?.status==='issued'&&number!==Number(existing.number))throw fail(409,'شمارهٔ فاکتور نهایی ثابت است');
+  return {number,invoiceDate:new Date(invoiceDate).toISOString(),customerName,phone,model:text(b.model,120),plate:digits(text(b.plate,30)),receptionId,items,subtotal,discount,total:subtotal-discount,draftPaid,notes:text(b.notes,2000)};
  }
  async function stock(c,req,r,items){const desired=new Map();for(const l of items.filter(l=>l.type==='goods'))desired.set(l.itemId,rounded((desired.get(l.itemId)||0)+l.quantity));const allocations=await c.query('SELECT * FROM invoice_stock WHERE invoice_id=$1',[r.id]),old=new Map(allocations.rows.map(a=>[a.item_id,a]));const ids=[...new Set([...desired.keys(),...old.keys()])].sort();const changes=ids.filter(id=>rounded((desired.get(id)||0)-Number(old.get(id)?.quantity||0))!==0);if(changes.length&&!inventoryEdit(req.user))throw fail(403,'ثبت یا اصلاح خروج کالا به مجوز ویرایش انبار خدمات نیاز دارد');
   for(const id of changes){const result=await c.query("SELECT * FROM inventory_items WHERE id=$1 AND scope='services' FOR UPDATE",[id]);const i=result.rows[0];if(!i||!i.active)throw fail(409,'برای اصلاح فاکتور، کالای حذف‌شده را ابتدا در انبار بازگردانید');const previous=Number(old.get(id)?.quantity||0),oldValue=Number(old.get(id)?.value_amount||0),target=desired.get(id)||0,delta=rounded(target-previous),n=Math.abs(delta);let value;if(delta>0){if(n>rounded(Number(i.quantity)-Number(i.loaned)))throw fail(409,'موجودی آزاد «'+i.name+'» کافی نیست');value=n===Number(i.quantity)?Number(i.stock_value):Math.round(Number(i.stock_value)*n/Number(i.quantity))}else value=n===previous?oldValue:Math.round(oldValue*n/previous);
@@ -52,8 +66,55 @@ function installInvoices(app,{q,pool,auth,periodOf,currentPeriod}){
  router.get('/catalog',wrap(async(req,res)=>{if(!inventoryAccess(req.user))return res.json([]);const r=await q("SELECT id,name,unit,(quantity-loaned)::text AS available FROM inventory_items WHERE scope='services' AND active=true ORDER BY name");res.json(r.rows.map(i=>({...i,available:Number(i.available)})))}));
  router.get('/',wrap(async(req,res)=>{const page=Number(req.query.page||0),status=text(req.query.status,20),search=text(digits(req.query.q),120).replace(/[يى]/g,'ی').replace(/ك/g,'ک'),reception=req.query.receptionId||'';if(!Number.isSafeInteger(page)||page<0||page>100000||status&&!['draft','issued'].includes(status)||reception&&!uuid(reception))throw fail(400,'فیلتر فاکتور معتبر نیست');const where=`($1='' OR status=$1) AND ($2='' OR strpos(translate(lower(replace(replace(customer_name||' '||phone||' '||model||' '||plate||' '||number::text,'ي','ی'),'ك','ک')),'۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩','01234567890123456789'),lower($2))>0) AND ($3='' OR reception_id::text=$3)`;const [rows,count]=await Promise.all([q(`SELECT * FROM invoices WHERE ${where} ORDER BY number DESC LIMIT 30 OFFSET $4`,[status,search,reception,page*30]),q(`SELECT COUNT(*)::int AS total FROM invoices WHERE ${where}`,[status,search,reception])]);res.json({items:rows.rows.map(publicInvoice),total:count.rows[0].total,page})}));
  router.get('/:id',wrap(async(req,res)=>{if(!uuid(req.params.id))throw fail(400,'شناسه معتبر نیست');const r=await q('SELECT * FROM invoices WHERE id=$1',[req.params.id]);if(!r.rowCount)throw fail(404,'فاکتور پیدا نشد');const [payments,events]=await Promise.all([q('SELECT id,amount,actor_name AS "actorName",created_at AS "createdAt" FROM invoice_payments WHERE invoice_id=$1 ORDER BY created_at',[req.params.id]),q('SELECT action,reason,actor_name AS "actorName",before_data AS "beforeData",after_data AS "afterData",created_at AS "createdAt" FROM invoice_events WHERE invoice_id=$1 ORDER BY created_at,id',[req.params.id])]);res.json({...publicInvoice(r.rows[0]),payments:payments.rows.map(p=>({...p,amount:Number(p.amount)})),events:events.rows})}));
- router.post('/',write,wrap(async(req,res)=>{res.status(201).json(await atomic(req,async c=>{if(!uuid(req.body.id))throw fail(400,'شناسه فرم معتبر نیست');const f=await fields(c,req);const result=await c.query(`INSERT INTO invoices(id,reception_id,customer_name,phone,model,plate,items,subtotal,discount,total,draft_paid,notes,created_by,actor_name) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) RETURNING number`,[req.body.id,f.receptionId,f.customerName,f.phone,f.model,f.plate,JSON.stringify(f.items),f.subtotal,f.discount,f.total,f.draftPaid,f.notes,req.user.sub,req.user.name]);await event(c,req,req.body.id,'created',null,f);return {id:req.body.id,number:Number(result.rows[0].number)}}))}));
- router.put('/:id',write,wrap(async(req,res)=>{res.json(await atomic(req,async c=>{const r=await invoice(c,req.params.id);version(req,r);const f=await fields(c,req,r);if(f.receptionId!==r.reception_id)throw fail(400,'ارتباط فاکتور با پذیرش قابل تغییر نیست');if(r.status==='issued'){if(!text(req.body.reason,500))throw fail(400,'دلیل ویرایش فاکتور نهایی را بنویسید');if(f.total<Number(r.paid))throw fail(409,'جمع جدید نمی‌تواند کمتر از مبلغ دریافت‌شده باشد');if(f.draftPaid!==Number(r.paid))throw fail(400,'برای دریافت وجه جدید از «ثبت دریافت» استفاده کنید');await stock(c,req,r,f.items)}await c.query('UPDATE invoices SET customer_name=$1,phone=$2,model=$3,plate=$4,items=$5,subtotal=$6,discount=$7,total=$8,draft_paid=$9,notes=$10,version=version+1,updated_at=NOW() WHERE id=$11',[f.customerName,f.phone,f.model,f.plate,JSON.stringify(f.items),f.subtotal,f.discount,f.total,f.draftPaid,f.notes,r.id]);await event(c,req,r.id,'edited',publicInvoice(r),f,req.body.reason);return {id:r.id,version:r.version+1}}))}));
+ router.post('/',write,wrap(async(req,res)=>{
+  const created=await atomic(req,async c=>{
+   const id=req.body.id;
+   if(!uuid(id))throw fail(400,'شناسه فرم معتبر نیست');
+   const f=await fields(c,req);
+   await c.query('SELECT pg_advisory_xact_lock(81407261)');
+   if(f.number===null){
+    const next=await c.query("SELECT GREATEST(nextval('invoices_number_seq'),COALESCE(MAX(number),0)+1) AS number FROM invoices");
+    f.number=Number(next.rows[0].number);
+   }
+   const duplicate=await c.query('SELECT 1 FROM invoices WHERE number=$1',[f.number]);
+   if(duplicate.rowCount)throw fail(409,'شماره فاکتور تکراری است');
+   await c.query(
+    `INSERT INTO invoices(id,number,invoice_date,reception_id,customer_name,phone,model,plate,items,subtotal,discount,total,draft_paid,notes,created_by,actor_name)
+     VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)`,
+    [id,f.number,f.invoiceDate,f.receptionId,f.customerName,f.phone,f.model,f.plate,JSON.stringify(f.items),f.subtotal,f.discount,f.total,f.draftPaid,f.notes,req.user.sub,req.user.name]
+   );
+   await event(c,req,id,'created',null,f);
+   return {id,number:f.number};
+  });
+  res.status(201).json(created);
+ }));
+ router.put('/:id',write,wrap(async(req,res)=>{
+  const edited=await atomic(req,async c=>{
+   const r=await invoice(c,req.params.id);
+   version(req,r);
+   const f=await fields(c,req,r);
+   if(f.receptionId!==r.reception_id)throw fail(400,'ارتباط فاکتور با پذیرش قابل تغییر نیست');
+   if(f.number!==Number(r.number)){
+    await c.query('SELECT pg_advisory_xact_lock(81407261)');
+    const duplicate=await c.query('SELECT 1 FROM invoices WHERE number=$1 AND id<>$2',[f.number,r.id]);
+    if(duplicate.rowCount)throw fail(409,'شماره فاکتور تکراری است');
+   }
+   if(r.status==='issued'){
+    if(!text(req.body.reason,500))throw fail(400,'دلیل ویرایش فاکتور نهایی را بنویسید');
+    if(f.total<Number(r.paid))throw fail(409,'جمع جدید نمی‌تواند کمتر از مبلغ دریافت‌شده باشد');
+    if(f.draftPaid!==Number(r.paid))throw fail(400,'برای دریافت وجه جدید از «ثبت دریافت» استفاده کنید');
+    await stock(c,req,r,f.items);
+   }
+   await c.query(
+    `UPDATE invoices SET customer_name=$1,phone=$2,model=$3,plate=$4,items=$5,subtotal=$6,discount=$7,total=$8,
+     draft_paid=$9,notes=$10,number=$11,invoice_date=$12,version=version+1,updated_at=NOW() WHERE id=$13`,
+    [f.customerName,f.phone,f.model,f.plate,JSON.stringify(f.items),f.subtotal,f.discount,f.total,f.draftPaid,f.notes,f.number,f.invoiceDate,r.id]
+   );
+   await event(c,req,r.id,'edited',publicInvoice(r),f,req.body.reason);
+   return {id:r.id,version:r.version+1};
+  });
+  res.json(edited);
+ }));
  router.post('/:id/issue',write,wrap(async(req,res)=>{res.json(await atomic(req,async c=>{const r=await invoice(c,req.params.id);version(req,r);if(r.status!=='draft')throw fail(409,'فاکتور قبلاً نهایی شده است');await stock(c,req,r,r.items);const paid=Number(r.draft_paid);if(paid>0)await payment(c,req,r,paid);await c.query("UPDATE invoices SET status='issued',paid=$1,issued_at=NOW(),updated_at=NOW(),version=version+1 WHERE id=$2",[paid,r.id]);await event(c,req,r.id,'issued',publicInvoice(r),{total:Number(r.total),paid});return {id:r.id,version:r.version+1}}))}));
  router.post('/:id/payments',write,wrap(async(req,res)=>{res.status(201).json(await atomic(req,async c=>{const r=await invoice(c,req.params.id);version(req,r);const amount=money(req.body.amount);if(r.status!=='issued'||amount===null||amount<=0||amount>Number(r.total)-Number(r.paid))throw fail(400,'مبلغ دریافت باید مثبت و حداکثر مانده فاکتور نهایی باشد');const p=await payment(c,req,r,amount);await c.query('UPDATE invoices SET paid=paid+$1,version=version+1,updated_at=NOW() WHERE id=$2',[amount,r.id]);await event(c,req,r.id,'payment',null,{amount,paid:Number(r.paid)+amount});return {id:r.id,version:r.version+1,paymentId:p.id}}))}));
  app.use('/api/invoices',router);
